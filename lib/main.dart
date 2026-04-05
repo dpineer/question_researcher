@@ -6,6 +6,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // 用于粘贴板复制功能
 import 'package:provider/provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:path/path.dart' as path;
@@ -324,6 +325,17 @@ class DatabaseHelper {
     final db = await database;
     await db.delete('saved_exams', where: 'id = ?', whereArgs: [id]);
   }
+
+  /// 更新已保存的测验数据（主要用于修改知识库原始文本）
+  static Future<int> updateExam(SavedExam exam) async {
+    final db = await database;
+    return await db.update(
+      'saved_exams',
+      exam.toMap(),
+      where: 'id = ?',
+      whereArgs: [exam.id],
+    );
+  }
 }
 
 // ==========================================
@@ -545,6 +557,53 @@ ${jsonEncode(errorLogs)}
       return "个性化指导生成失败。";
     }
   }
+
+  /// 生成用于辅助理解的 DAG 图 (基于 Mermaid graph TD 语法)
+  static Future<String> generateKnowledgeDAG(String contextText) async {
+    final apiKey = await ConfigService.getDeepSeekKey();
+    if (apiKey.isEmpty) {
+      AppLogger.log("DAG 生成失败: 未配置云端 API Key", isError: true);
+      return "错误: 未配置云端 API Key";
+    }
+
+    final prompt = """
+你是一个数据结构化图谱专家。请基于以下【原始文本】，提取核心业务概念、实体及其内在逻辑关联，生成一个用于辅助理解的 DAG（有向无环图）。
+要求：
+1. 严格按照 Mermaid 的 graph TD 语法输出。
+2. 节点命名需简明扼要，连接线可包含动作语义。
+3. 禁止输出任何非 Mermaid 格式的无关解释文本。
+
+【原始文本】：
+$contextText
+""";
+
+    AppLogger.log("向云端大模型请求生成知识结构 DAG 图...");
+
+    try {
+      final response = await _dio.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        options: Options(
+          headers: {"Authorization": "Bearer $apiKey", "Content-Type": "application/json"},
+          receiveTimeout: const Duration(minutes: 3),
+        ),
+        data: {
+          "model": "deepseek-chat",
+          "messages":[
+            {"role": "system", "content": "你是一个严格的 Mermaid DAG 代码生成器。"},
+            {"role": "user", "content": prompt}
+          ],
+          "temperature": 0.2,
+        },
+      );
+      
+      String content = response.data['choices'][0]['message']['content'];
+      // 清理 Markdown 标记，仅保留纯粹的 Mermaid DSL
+      return content.replaceAll(RegExp(r'^```mermaid\s*|^```\s*', multiLine: true), '').replaceAll(RegExp(r'```$'), '').trim();
+    } catch (e) {
+      AppLogger.log("DAG 生成请求异常: $e", isError: true);
+      return "DAG 生成异常: $e";
+    }
+  }
 }
 
 // ==========================================
@@ -762,6 +821,23 @@ class _HomeScreenState extends State<HomeScreen> {
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children:[
+                          // 新增：编辑原始知识库
+                          IconButton(
+                            icon: const Icon(Icons.edit_document, color: Colors.teal),
+                            tooltip: "编辑原始知识库",
+                            onPressed: () {
+                              if (item.knowledgeBase.isEmpty) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text("当前题库无原始知识库缓存，无法编辑。"))
+                                );
+                                return;
+                              }
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(builder: (_) => KnowledgeEditScreen(exam: item))
+                              ).then((_) => _loadHistory()); // 返回后刷新列表
+                            }
+                          ),
                           // 新增：重新从原知识库生成试卷
                           IconButton(
                             icon: const Icon(Icons.refresh, color: Colors.blue), 
@@ -1508,6 +1584,175 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: FilledButton(onPressed: _saveConfig, child: const Text("保存并应用")),
             ),
         ]),
+      ),
+    );
+  }
+}
+
+// ==========================================
+// 视图层 - 原始知识库编辑与 DAG 辅助理解组件
+// ==========================================
+
+class KnowledgeEditScreen extends StatefulWidget {
+  final SavedExam exam;
+  const KnowledgeEditScreen({super.key, required this.exam});
+
+  @override
+  State<KnowledgeEditScreen> createState() => _KnowledgeEditScreenState();
+}
+
+class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
+  late TextEditingController _textController;
+  bool _isSaving = false;
+  bool _isGeneratingDAG = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _textController = TextEditingController(text: widget.exam.knowledgeBase);
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    super.dispose();
+  }
+
+  /// 业务逻辑：持久化保存修改后的文本
+  Future<void> _saveChanges() async {
+    setState(() => _isSaving = true);
+    final updatedExam = SavedExam(
+      id: widget.exam.id,
+      title: widget.exam.title,
+      examJson: widget.exam.examJson, // 保留原有考题 JSON
+      knowledgeBase: _textController.text.trim(), // 更新原始参考文本
+      createdAt: widget.exam.createdAt,
+    );
+    await DatabaseHelper.updateExam(updatedExam);
+    setState(() => _isSaving = false);
+    
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 原始数据已成功更新")));
+      Navigator.pop(context);
+    }
+  }
+
+  /// 业务逻辑：触发 DAG 生成并弹出结构化视图
+  Future<void> _generateDAG() async {
+    final text = _textController.text.trim();
+    if (text.isEmpty) return;
+
+    setState(() => _isGeneratingDAG = true);
+    final dagCode = await DualAIService.generateKnowledgeDAG(text);
+    setState(() => _isGeneratingDAG = false);
+
+    if (mounted) {
+      _showDAGDialog(dagCode);
+    }
+  }
+
+  /// 渲染逻辑：展示生成的 DAG Mermaid 代码，并在 Linux 桌面端提供一键复制与提示
+  void _showDAGDialog(String dagCode) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children:[
+            const Icon(Icons.account_tree, color: Colors.blue),
+            const SizedBox(width: 8),
+            const Text("概念关联 DAG 图 (Mermaid)"),
+          ],
+        ),
+        content: SizedBox(
+          width: 600,
+          height: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children:[
+              const Text("已为您抽取出关键信息的逻辑化有向无环图，您可以复制下方代码并在任意支持 Mermaid 的渲染器中查看：", style: TextStyle(fontSize: 13, color: Colors.grey)),
+              const SizedBox(height: 12),
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceVariant,
+                    borderRadius: BorderRadius.circular(8)
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      dagCode,
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions:[
+          TextButton.icon(
+            icon: const Icon(Icons.copy),
+            label: const Text("复制代码"),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: dagCode));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("DAG 代码已复制到剪贴板")));
+            },
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("关闭"),
+          )
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("编辑参考数据：${widget.exam.title}"),
+        actions:[
+          IconButton(
+            icon: _isSaving ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.save),
+            tooltip: "保存并覆盖",
+            onPressed: _isSaving ? null : _saveChanges,
+          ),
+          const SizedBox(width: 16),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          children:[
+            Expanded(
+              child: TextField(
+                controller: _textController,
+                maxLines: null,
+                expands: true,
+                textAlignVertical: TextAlignVertical.top,
+                decoration: const InputDecoration(
+                  hintText: "在此编辑、修改或补充原始参考资料...",
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: FilledButton.icon(
+                icon: _isGeneratingDAG 
+                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) 
+                  : const Icon(Icons.account_tree),
+                label: Text(_isGeneratingDAG ? "正在执行逻辑流抽提..." : "AI 辅助理解：生成逻辑 DAG 图"),
+                onPressed: _isGeneratingDAG ? null : _generateDAG,
+              ),
+            )
+          ],
+        ),
       ),
     );
   }
