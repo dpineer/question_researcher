@@ -5,6 +5,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
+import 'dart:math' as math; // 用于处理向量相似度计算中的数学函数
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'; // 用于粘贴板复制功能
 import 'package:provider/provider.dart';
@@ -14,7 +15,11 @@ import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:pdfx/pdfx.dart';
+
+//[新增] Markdown与Latex渲染依赖
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:flutter_markdown_plus_latex/flutter_markdown_plus_latex.dart';
+import 'package:markdown/markdown.dart' as md;
 
 // ==========================================
 // 附加服务：全局业务日志总线 (替代底层 tail)
@@ -30,6 +35,35 @@ class AppLogger {
     _controller.add(logLine);
     debugPrint(logLine);
   }
+}
+
+// ==========================================
+// 附加服务：Markdown与LaTeX动态渲染器
+// ==========================================
+String _preprocessLatex(String text) {
+  if (text.isEmpty) return "正在检索知识库...";
+  // 标准化 LaTeX 块级与行内符号边界
+  return text
+      .replaceAll(r'\[', r'$$')
+      .replaceAll(r'\]', r'$$')
+      .replaceAll(r'\(', r'$')
+      .replaceAll(r'\)', r'$');
+}
+
+Widget _renderMarkdown(String content, {bool isSelectable = false, bool shrinkWrap = true}) {
+  final processedContent = _preprocessLatex(content);
+  return MarkdownBody(
+    data: processedContent,
+    selectable: isSelectable,
+    shrinkWrap: shrinkWrap,
+    builders: {
+      'latex': LatexElementBuilder(
+        textStyle: const TextStyle(fontWeight: FontWeight.w400, fontSize: 16.0),
+      ),
+    },
+    extensionSet: md.ExtensionSet([...md.ExtensionSet.gitHubFlavored.blockSyntaxes, LatexBlockSyntax()],[...md.ExtensionSet.gitHubFlavored.inlineSyntaxes, LatexInlineSyntax()],
+    ),
+  );
 }
 
 // ==========================================
@@ -607,18 +641,117 @@ $contextText
 }
 
 // ==========================================
-// 5. 状态管理 - 出题控制与做题引擎
+// 4. 服务层 - 附加轻量级向量检索服务 (修复版)
+// ==========================================
+class SemanticRetrievalService {
+  static final Dio _dio = Dio();
+
+  static List<String> _chunkText(String text, {int chunkSize = 600, int overlap = 100}) {
+    if (text.length <= chunkSize) return [text];
+    List<String> chunks =[];
+    int start = 0;
+    while (start < text.length) {
+      int end = start + chunkSize;
+      if (end > text.length) end = text.length;
+      chunks.add(text.substring(start, end));
+      start += (chunkSize - overlap);
+    }
+    return chunks;
+  }
+
+  static double _cosineSimilarity(List<double> v1, List<double> v2) {
+    double dotProduct = 0.0, normA = 0.0, normB = 0.0;
+    for (int i = 0; i < v1.length; i++) {
+      dotProduct += v1[i] * v2[i];
+      normA += v1[i] * v1[i];
+      normB += v2[i] * v2[i];
+    }
+    if (normA == 0 || normB == 0) return 0.0;
+    return dotProduct / (math.sqrt(normA) * math.sqrt(normB));
+  }
+
+  /// 修复版 RAG 检索：采用串行处理切片以适应本地小模型，并实时回传进度
+  static Future<String> getRelevantContext(
+    String rawText, 
+    String query, 
+    String model, 
+    String baseUrl,
+    {Function(String status, double progress)? onProgress}
+  ) async {
+    if (model.isEmpty) return rawText;
+
+    onProgress?.call("正在进行文本语义分块 (Chunking)...", 0.05);
+    // 降低 chunk 尺寸以确保绝不会超出 2048 token 的小模型限制
+    final chunks = _chunkText(rawText, chunkSize: 600, overlap: 100);
+    AppLogger.log("文本已切分为 ${chunks.length} 个切片");
+
+    List<List<double>> chunkEmbeddings =[];
+    
+    // 采用串行逐一请求代替批量请求，解决本地模型不支持 Batching 的问题
+    for (int i = 0; i < chunks.length; i++) {
+      onProgress?.call("本地 Embedding 向量化: 第 ${i + 1}/${chunks.length} 块", 0.05 + 0.8 * (i / chunks.length));
+      try {
+        final response = await _dio.post(
+          '$baseUrl/embeddings',
+          data: {"model": model, "input": chunks[i]}, // 单个 String 而非 List
+          options: Options(receiveTimeout: const Duration(seconds: 30)),
+        );
+        chunkEmbeddings.add(List<double>.from(response.data['data'][0]['embedding']));
+      } catch (e) {
+        AppLogger.log("第 $i 块 Embedding 失败: $e", isError: true);
+        // 如果出错，注入一个空的占位向量防止后续对齐奔溃
+        chunkEmbeddings.add(List<double>.filled(1536, 0.0)); 
+      }
+    }
+
+    onProgress?.call("正在生成用户主题的参考向量...", 0.90);
+    List<double> queryVector =[];
+    try {
+      final qRes = await _dio.post('$baseUrl/embeddings', data: {"model": model, "input": query});
+      queryVector = List<double>.from(qRes.data['data'][0]['embedding']);
+    } catch (e) {
+      AppLogger.log("主题向量生成失败: $e", isError: true);
+      return rawText; // 彻底失败则回退全量
+    }
+
+    onProgress?.call("正在计算余弦相似度并排序...", 0.95);
+    List<MapEntry<String, double>> scoredChunks =[];
+    for (int i = 0; i < chunks.length; i++) {
+      final sim = _cosineSimilarity(queryVector, chunkEmbeddings[i]);
+      scoredChunks.add(MapEntry(chunks[i], sim));
+    }
+    
+    scoredChunks.sort((a, b) => b.value.compareTo(a.value));
+    
+    // 提取最相关的前 5 个片段
+    int maxSelected = math.min(5, scoredChunks.length);
+    List<String> selectedChunks = scoredChunks.take(maxSelected).map((e) => e.key).toList();
+
+    onProgress?.call("上下文检索优化完成！", 1.0);
+    return selectedChunks.join("\n\n");
+  }
+}
+
+// ==========================================
+// 5. 状态管理 - 出题控制与做题引擎 (进度管理追加)
 // ==========================================
 class ExamProvider extends ChangeNotifier {
   bool _isLoading = false;
   bool get isLoading => _isLoading;
+  
   String _loadingStatus = "";
   String get loadingStatus => _loadingStatus;
+  
+  // 新增：具体的进度百分比值 (0.0 ~ 1.0)
+  double _processProgress = 0.0;
+  double get processProgress => _processProgress;
+  
   String _errorMessage = "";
   String get errorMessage => _errorMessage;
 
-  void _updateStatus(String status) {
+  void _updateProgress(String status, double progress) {
     _loadingStatus = status;
+    _processProgress = progress;
     notifyListeners();
   }
 
@@ -627,39 +760,52 @@ class ExamProvider extends ChangeNotifier {
   }) async {
     _isLoading = true;
     _errorMessage = "";
-    notifyListeners();
+    _updateProgress("引擎启动中...", 0.0);
+
+    int? currentExamId; 
 
     try {
       if ((await ConfigService.getDeepSeekKey()).isEmpty) throw Exception("请先在设置中配置云端 API Key");
 
-      AppLogger.log("🚀 开始触发全局双擎制卷任务...");
-      
-      // 如果启用了rerank功能，则先对内容进行重排序
+      _updateProgress("正在将原始知识库即时持久化...", 0.02);
+      final provisionalExam = SavedExam(title: topic, examJson: "[]", knowledgeBase: rawText, createdAt: DateTime.now().millisecondsSinceEpoch);
+      currentExamId = await DatabaseHelper.saveExam(provisionalExam);
+
       String processedText = rawText;
+      final embeddingModel = await ConfigService.getEmbeddingModel();
+      final lmUrl = await ConfigService.getLmStudioUrl();
+      
+      // 优化：不再使用字符长度卡死，只要有 embedding 模型且文本超过单块容量(600)即触发
+      if (embeddingModel.isNotEmpty && rawText.length > 600) {
+        processedText = await SemanticRetrievalService.getRelevantContext(
+          rawText, topic, embeddingModel, lmUrl,
+          onProgress: (status, progress) => _updateProgress(status, progress)
+        );
+      }
+
       final enableRerank = await ConfigService.getEnableRerank();
       if (enableRerank) {
-        AppLogger.log("正在使用重排序模型优化内容...");
-        processedText = await DualAIService._rerankContent(rawText);
+        _updateProgress("正在执行 Rerank 精细重排序...", 1.0); // 进度条拉满进入模型推理状态
+        processedText = await DualAIService._rerankContent(processedText);
       }
       
+      _updateProgress("正在请求云端大模型构建结构化试卷...", 1.0); // 变为无尽等待状态
       final result = await DualAIService.generateMixedExam(
         contextText: processedText, topic: topic, count: count, difficulty: difficulty,
       );
 
       if (result.containsKey("error")) throw Exception(result["error"]);
 
-      AppLogger.log("正在持久化写入 SQLite 知识库...");
+      _updateProgress("正在持久化最终考题...", 1.0);
       final examJsonStr = jsonEncode(result['questions'] ??[]);
-      // 追加知识库入库
-      final newExam = SavedExam(title: topic, examJson: examJsonStr, knowledgeBase: rawText, createdAt: DateTime.now().millisecondsSinceEpoch);
-      await DatabaseHelper.saveExam(newExam);
-      AppLogger.log("💾 数据库存储完成！新卷准备就绪。");
+
+      final finalExam = SavedExam(id: currentExamId, title: topic, examJson: examJsonStr, knowledgeBase: rawText, createdAt: provisionalExam.createdAt);
+      await DatabaseHelper.updateExam(finalExam);
 
       _isLoading = false;
       notifyListeners();
       return true;
     } catch (e) {
-      AppLogger.log("出题管线中断崩溃: $e", isError: true);
       _errorMessage = e.toString().replaceFirst("Exception: ", "");
       _isLoading = false;
       notifyListeners();
@@ -937,7 +1083,7 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
                       child: Text(_getFormatTypeName(q.type), style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer, fontSize: 12)),
                     ),
                     const SizedBox(width: 8),
-                    Expanded(child: Text(q.question, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+                    Expanded(child: _renderMarkdown("### " + q.question, shrinkWrap: true)), // 使用 markdown H3 维持字号与加粗
                   ],
                 ),
                 const SizedBox(height: 24),
@@ -992,7 +1138,7 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
     if (q.type == 'single_choice') {
       return Column(
         children: q.options.map((opt) => RadioListTile<String>(
-          title: Text(opt),
+          title: _renderMarkdown(opt, shrinkWrap: true), // 注入 Latex 渲染
           value: opt,
           groupValue: currentAns as String?,
           onChanged: (v) => provider.setAnswer(v),
@@ -1002,7 +1148,7 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
       List<String> selections = currentAns != null ? List<String>.from(currentAns) :[];
       return Column(
         children: q.options.map((opt) => CheckboxListTile(
-          title: Text(opt),
+          title: _renderMarkdown(opt, shrinkWrap: true), // 注入 Latex 渲染
           value: selections.contains(opt),
           onChanged: (checked) {
             if (checked == true) selections.add(opt); else selections.remove(opt);
@@ -1065,44 +1211,55 @@ class ExamResultScreen extends StatelessWidget {
                 elevation: 2, margin: const EdgeInsets.only(bottom: 24),
                 child: Padding(
                   padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children:[
-                      Text("Q${idx + 1}. ${q.question}", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 12),
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceVariant, borderRadius: BorderRadius.circular(8)),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children:[
+                        // 题干渲染
+                        _renderMarkdown("**Q${idx + 1}.** ${q.question}", shrinkWrap: true),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceVariant, borderRadius: BorderRadius.circular(8)),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children:[
+                              // 用户回答与标准答案渲染
+                              const Text("📝 你的回答:", style: TextStyle(fontWeight: FontWeight.bold)),
+                              const SizedBox(height: 4),
+                              _renderMarkdown(userAns.toString(), shrinkWrap: true),
+                              const SizedBox(height: 8),
+                              const Text("🔑 标准答案:", style: TextStyle(fontWeight: FontWeight.bold)),
+                              const SizedBox(height: 4),
+                              _renderMarkdown(q.correctAnswer.toString(), shrinkWrap: true),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        // AI 评价模块渲染
+                        Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(color: Colors.amber.withOpacity(0.1), border: Border.all(color: Colors.amber.withOpacity(0.5)), borderRadius: BorderRadius.circular(12)),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Row(children:[Icon(Icons.psychology, color: Colors.orange), SizedBox(width: 8), Text("AI 导师诊断:", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange))]),
+                              const Divider(),
+                              _renderMarkdown(aiFeedback, shrinkWrap: true),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        // 解析模块渲染
+                        ExpansionTile(
+                          title: const Text("查看题目标准解析"),
                           children:[
-                            Text("📝 你的回答: $userAns", style: TextStyle(color: isCorrect ? Colors.green.shade700 : Colors.red.shade700, fontWeight: FontWeight.bold)),
-                            const SizedBox(height: 8),
-                            Text("🔑 标准答案: ${q.correctAnswer}"),
+                            Padding(
+                              padding: const EdgeInsets.all(16.0), 
+                              child: _renderMarkdown(q.analysis, shrinkWrap: true)
+                            )
                           ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      // AI 私人辅导模块
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(color: Colors.amber.withOpacity(0.1), border: Border.all(color: Colors.amber.withOpacity(0.5)), borderRadius: BorderRadius.circular(12)),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Row(children:[Icon(Icons.psychology, color: Colors.orange), SizedBox(width: 8), Text("AI 导师诊断:", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange))]),
-                            const Divider(),
-                            Text(aiFeedback, style: const TextStyle(height: 1.5)),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      // 标准题解
-                      ExpansionTile(
-                        title: const Text("查看题目标准解析"),
-                        children:[Padding(padding: const EdgeInsets.all(16.0), child: Text(q.analysis, style: const TextStyle(color: Colors.grey)))],
-                      )
-                    ],
+                        )
+                      ],
                   ),
                 ),
               );
@@ -1212,7 +1369,11 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   bool _isProcessingFiles = false;
   int _totalFilesToProcess = 0;
   int _processedFilesCount = 0;
-  String _currentProcessingFileName = "";
+
+  // --- OCR 选项配置 ---
+  bool _enableOCR = true;
+  final String _ocrModel = "vision-model";
+  bool _useNativePDF = true;
 
   // --- 状态机：系统内部日志 ---
   final List<String> _logLines = ["[INFO] 系统已就绪，等待注入资料..."];
@@ -1231,6 +1392,16 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         if (_logLines.length > 300) _logLines.removeAt(0); // 维持日志池水位
       });
       if (_isLogPanelExpanded) _scrollToBottom();
+    });
+    
+    // 初次录入时默认展开日志面板，方便用户查看处理过程
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        setState(() {
+          _isLogPanelExpanded = true;
+        });
+        _scrollToBottom();
+      }
     });
   }
 
@@ -1271,30 +1442,48 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
       _scrollToBottom();
       
       AppLogger.log("📥 开始批量导入 $_totalFilesToProcess 个文件");
+      AppLogger.log("📊 多模态模型配置: 启用=$_enableOCR, 模型=$_ocrModel, 原生PDF=$_useNativePDF");
+      
       for (int i = 0; i < result.files.length; i++) {
         var file = result.files[i];
         String filePath = file.path!;
         String ext = path.extension(filePath).toLowerCase();
-        
-        setState(() => _currentProcessingFileName = file.name);
 
         String content = "";
         try {
           if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
-            content = await DualAIService.performLocalOCR(filePath);
+            if (_enableOCR) {
+              AppLogger.log("🔍 对图片文件 ${file.name} 启用多模态模型识别");
+              content = await DualAIService.performLocalOCR(filePath);
+            } else {
+              AppLogger.log("⚠️  多模态模型已禁用，跳过图片文件 ${file.name}");
+              content = "[图片文件，多模态模型已禁用]";
+            }
           } else if (ext == '.pdf') {
-             // 简化展示调用，保留你原有的原生 PDF 依赖逻辑
-             if (io.Platform.isLinux || io.Platform.isWindows || io.Platform.isMacOS) {
-                try { content = await _parsePdfWithOCR(filePath); } 
-                catch (e) { content = await DualAIService.performLocalOCR(filePath); }
-             } else {
-                content = await _parsePdfWithOCR(filePath);
-             }
+            if (_enableOCR) {
+              AppLogger.log("🔍 对 PDF 文件 ${file.name} 启用多模态模型识别");
+              if (_useNativePDF && (io.Platform.isLinux || io.Platform.isWindows || io.Platform.isMacOS)) {
+                try { 
+                  content = await _parsePdfWithOCR(filePath); 
+                  AppLogger.log("✅ PDF 原生解析成功: ${file.name}");
+                } catch (e) { 
+                  AppLogger.log("⚠️  PDF 原生解析失败，回退到视觉模型: $e", isError: true);
+                  content = await DualAIService.performLocalOCR(filePath); 
+                }
+              } else {
+                content = await DualAIService.performLocalOCR(filePath);
+              }
+            } else {
+              AppLogger.log("⚠️  多模态模型已禁用，跳过 PDF 文件 ${file.name}");
+              content = "[PDF 文件，多模态模型已禁用]";
+            }
           } else {
             content = await io.File(filePath).readAsString();
+            AppLogger.log("📄 文本文件 ${file.name} 读取成功，长度: ${content.length} 字符");
           }
         } catch (e) {
           content = "\n[文件 ${file.name} 解析失败: $e]";
+          AppLogger.log("❌ 文件 ${file.name} 解析失败: $e", isError: true);
         }
 
         setState(() {
@@ -1432,14 +1621,35 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text("混合题型生成器")),
       body: provider.isLoading 
-      ? Center(child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children:[
-             const CircularProgressIndicator(),
-             const SizedBox(height: 16),
-             Text(provider.loadingStatus, style: const TextStyle(fontWeight: FontWeight.bold))
-          ],
-        ))
+      ? Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 64.0), // 限制宽度使其优雅
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children:[
+                // 当进度到达 1.0 时，表示进入大模型思考环节，转为循环动画；否则显示实际百分比进度
+                provider.processProgress >= 1.0
+                    ? const CircularProgressIndicator()
+                    : LinearProgressIndicator(
+                        value: provider.processProgress,
+                        minHeight: 8,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                const SizedBox(height: 24),
+                Text(
+                  provider.loadingStatus, 
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+                ),
+                const SizedBox(height: 8),
+                if (provider.processProgress < 1.0 && provider.processProgress > 0)
+                  Text(
+                    "${(provider.processProgress * 100).toStringAsFixed(1)}%",
+                    style: const TextStyle(color: Colors.grey, fontFamily: 'monospace'),
+                  )
+              ],
+            ),
+          ),
+        )
       : Column(
           children:[
             Expanded(
@@ -1462,12 +1672,16 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       ]
                     ),
                     const SizedBox(height: 8),
+                    
+                    const SizedBox(height: 16),
                     TextField(
                       controller: _textController, 
                       maxLines: 15, 
-                      decoration: const InputDecoration(
-                        hintText: "在此粘贴长文本，支持导入纯文本、图片或扫描件PDF。本地视觉模型将自动提取文字并剥离噪声...", 
-                        border: OutlineInputBorder()
+                      decoration: InputDecoration(
+                        hintText: _enableOCR 
+                          ? "在此粘贴长文本，支持导入纯文本、图片或扫描件PDF。本地视觉模型将自动提取文字并剥离噪声..." 
+                          : "在此粘贴长文本，支持导入纯文本。多模态模型功能已禁用，图片和PDF文件将不会被识别。",
+                        border: const OutlineInputBorder()
                       )
                     ),
                     const SizedBox(height: 24),
@@ -1605,11 +1819,110 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
   late TextEditingController _textController;
   bool _isSaving = false;
   bool _isGeneratingDAG = false;
+  
+  // --- 状态机：文件处理进度 ---
+  bool _isProcessingFiles = false;
+  int _totalFilesToProcess = 0;
+  int _processedFilesCount = 0;
+
+  // --- 多模态模型选项配置 ---
+  bool _enableOCR = true;
+  final String _ocrModel = "vision-model";
+  bool _useNativePDF = true;
 
   @override
   void initState() {
     super.initState();
     _textController = TextEditingController(text: widget.exam.knowledgeBase);
+  }
+
+  // --- [新增业务] 文件解析与多模态流集成 ---
+  Future<void> _importFile() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom, 
+      allowedExtensions:['txt', 'md', 'json', 'png', 'jpg', 'jpeg', 'pdf'],
+      allowMultiple: true, 
+    );
+    
+    if (result != null && result.files.isNotEmpty) {
+      setState(() {
+        _isProcessingFiles = true;
+        _totalFilesToProcess = result.files.length;
+        _processedFilesCount = 0;
+      });
+      
+      AppLogger.log("📥 追加导入 $_totalFilesToProcess 个文件至知识库编辑区");
+      
+      for (int i = 0; i < result.files.length; i++) {
+        var file = result.files[i];
+        String filePath = file.path!;
+        String ext = path.extension(filePath).toLowerCase();
+
+        String content = "";
+        try {
+          if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
+            if (_enableOCR) {
+              content = await DualAIService.performLocalOCR(filePath);
+            } else {
+              content = "[图片文件，多模态模型已禁用]";
+            }
+          } else if (ext == '.pdf') {
+            if (_enableOCR) {
+              if (_useNativePDF && io.Platform.isLinux) {
+                try { 
+                  content = await _parsePdfWithOCR(filePath); 
+                } catch (e) { 
+                  content = await DualAIService.performLocalOCR(filePath); 
+                }
+              } else {
+                content = await DualAIService.performLocalOCR(filePath);
+              }
+            } else {
+              content = "[PDF 文件，多模态模型已禁用]";
+            }
+          } else {
+            content = await io.File(filePath).readAsString();
+          }
+        } catch (e) {
+          content = "\n[文件 ${file.name} 解析失败: $e]";
+        }
+
+        setState(() {
+          final prefix = _textController.text.isEmpty ? "" : "\n\n";
+          _textController.text += "$prefix--- 📄 追加文件来源: ${file.name} ---\n$content";
+          _processedFilesCount++;
+        });
+      }
+      
+      setState(() => _isProcessingFiles = false);
+      AppLogger.log("✅ 追加队列全部解析完毕，已注入编辑器。");
+    }
+  }
+
+  // --- [新增业务] Linux 依赖级 PDF 切割 ---
+  Future<String> _parsePdfWithOCR(String filePath) async {
+    try {
+      final check = await io.Process.run('which',['pdftoppm']);
+      if (check.exitCode != 0) throw Exception("缺少 Linux 原生 PDF 依赖...");
+
+      final tempDir = await io.Directory.systemTemp.createTemp('ai_teacher_pdf_');
+      await io.Process.run('pdftoppm',['-png', '-r', '150', filePath, '${tempDir.path}/page']);
+
+      String accumulatedContent = "";
+      final files = tempDir.listSync().whereType<io.File>().where((f) => f.path.endsWith('.png')).toList();
+      files.sort((a, b) => a.path.compareTo(b.path));
+
+      for (int i = 0; i < files.length; i++) {
+        final pageText = await DualAIService.performLocalOCR(files[i].path);
+        accumulatedContent += "\n[第${i+1}页提取]:\n$pageText\n";
+        if (i < files.length - 1) await Future.delayed(const Duration(seconds: 2));
+      }
+
+      await tempDir.delete(recursive: true); 
+      return accumulatedContent;
+    } catch (e) {
+      return "[PDF 视觉提取失败]: $e";
+    }
   }
 
   @override
@@ -1618,14 +1931,47 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
     super.dispose();
   }
 
-  /// 业务逻辑：持久化保存修改后的文本
+  /// 业务逻辑：持久化保存修改后的文本（可选执行 Rerank 优化）
   Future<void> _saveChanges() async {
     setState(() => _isSaving = true);
+    
+    String finalText = _textController.text.trim();
+    
+    // 检查是否启用 Rerank 功能
+    final enableRerank = await ConfigService.getEnableRerank();
+    if (enableRerank) {
+      final rerankModel = await ConfigService.getRerankModel();
+      if (rerankModel.isNotEmpty) {
+        // 显示 Rerank 进度条
+        AppLogger.log("启动 Rerank 优化模型处理知识库文本...");
+        try {
+          final localUrl = await ConfigService.getLmStudioUrl();
+          final response = await Dio().post(
+            '$localUrl/chat/completions',
+            options: Options(receiveTimeout: const Duration(minutes: 5)),
+            data: {
+              "model": rerankModel, 
+              "messages":[
+                {"role": "system", "content": "你是一个文本重排序专家。请对输入的文本进行重新排序，将最重要的内容放在前面，按重要性递减的顺序排列。"},
+                {"role": "user", "content": "请对以下文本进行重排序：\n\n文本：$finalText"}
+              ],
+              "temperature": 0.1,
+            },
+          );
+          final usage = response.data['usage'];
+          AppLogger.log("Rerank 处理完毕，消耗 Tokens: [Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
+          finalText = response.data['choices'][0]['message']['content'];
+        } catch (e) {
+          AppLogger.log("Rerank 模型返回异常，使用原始文本保存", isError: true);
+        }
+      }
+    }
+    
     final updatedExam = SavedExam(
       id: widget.exam.id,
       title: widget.exam.title,
       examJson: widget.exam.examJson, // 保留原有考题 JSON
-      knowledgeBase: _textController.text.trim(), // 更新原始参考文本
+      knowledgeBase: finalText, // 更新原始参考文本（可能经过 Rerank 优化）
       createdAt: widget.exam.createdAt,
     );
     await DatabaseHelper.updateExam(updatedExam);
@@ -1642,11 +1988,14 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
     final text = _textController.text.trim();
     if (text.isEmpty) return;
 
-    setState(() => _isGeneratingDAG = true);
-    final dagCode = await DualAIService.generateKnowledgeDAG(text);
-    setState(() => _isGeneratingDAG = false);
-
     if (mounted) {
+      setState(() => _isGeneratingDAG = true);
+    }
+    
+    final dagCode = await DualAIService.generateKnowledgeDAG(text);
+    
+    if (mounted) {
+      setState(() => _isGeneratingDAG = false);
       _showDAGDialog(dagCode);
     }
   }
@@ -1727,15 +2076,40 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
         padding: const EdgeInsets.all(24.0),
         child: Column(
           children:[
+            const SizedBox(height: 16),
+            // [新增视图结构] 补充文件系统映射的触发器
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children:[
+                const Text("原始参考文本内容", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                _isProcessingFiles 
+                ? Row(
+                    children:[
+                      const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                      const SizedBox(width: 8),
+                      Text("处理中: $_processedFilesCount / $_totalFilesToProcess", style: TextStyle(color: Theme.of(context).colorScheme.primary))
+                    ],
+                  )
+                : TextButton.icon(
+                    icon: const Icon(Icons.drive_folder_upload),
+                    label: const Text("选择文件追加导入"),
+                    onPressed: _importFile,
+                  )
+              ],
+            ),
+            const SizedBox(height: 8),
+
             Expanded(
               child: TextField(
                 controller: _textController,
                 maxLines: null,
                 expands: true,
                 textAlignVertical: TextAlignVertical.top,
-                decoration: const InputDecoration(
-                  hintText: "在此编辑、修改或补充原始参考资料...",
-                  border: OutlineInputBorder(),
+                decoration: InputDecoration(
+                  hintText: _enableOCR 
+                    ? "在此编辑、修改或补充原始参考资料...支持导入纯文本、图片或扫描件PDF。本地视觉模型将自动提取文字并剥离噪声..." 
+                    : "在此编辑、修改或补充原始参考资料...多模态模型功能已禁用，图片和PDF文件将不会被识别。",
+                  border: const OutlineInputBorder(),
                 ),
               ),
             ),
