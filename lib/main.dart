@@ -38,12 +38,13 @@ class AppLogger {
 }
 
 // ==========================================
-// 附加视图层 - 知识库专属 Q&A 问答交互界面
+// 附加视图层 - 知识库专属 Q&A 问答交互界面 (完整升级版)
 // ==========================================
 class ChatMessage {
   final String role; // 'user' or 'ai'
   final String text;
-  ChatMessage({required this.role, required this.text});
+  final List<String>? sourceChunks; // [新增] 溯源内容
+  ChatMessage({required this.role, required this.text, this.sourceChunks});
 }
 
 class ChatWithKnowledgeScreen extends StatefulWidget {
@@ -61,13 +62,14 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
   
   bool _isReplying = false;
   bool _isGeneratingDAG = false;
+  bool _isProcessingImage = false; // 控制图片解析状态
 
   @override
   void initState() {
     super.initState();
     _messages.add(ChatMessage(
       role: 'ai', 
-      text: "您好！我是您的 AI 助教。我已经阅读了题库 **【${widget.exam.title}】** 的所有知识源。有什么关于这部分内容的问题需要和我探讨吗？"
+      text: "您好！我已经向量化学习了 **【${widget.exam.title}】**。您可以输入文字提问，或者点击左下角上传图片/文档，我会自动提取其中内容作为讨论上下文！"
     ));
   }
 
@@ -83,6 +85,38 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
     });
   }
 
+  // --- [新增逻辑] 处理用户在对话框提交的文件/图片 ---
+  Future<void> _handleFileAttachment() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom, 
+      allowedExtensions: ['png', 'jpg', 'jpeg', 'pdf', 'txt'],
+    );
+    if (result != null && result.files.isNotEmpty) {
+      setState(() => _isProcessingImage = true);
+      String filePath = result.files.single.path!;
+      String ext = path.extension(filePath).toLowerCase();
+      String extractedText = "";
+
+      try {
+        if (['.png', '.jpg', '.jpeg', '.pdf'].contains(ext)) {
+           extractedText = await DualAIService.performLocalOCR(filePath);
+        } else {
+           extractedText = await io.File(filePath).readAsString();
+        }
+        
+        if (extractedText.trim().isNotEmpty) {
+          // 将提取的内容直接填入输入框，让用户自由决定如何使用（提问或者要求收录）
+          final prefix = _chatController.text.isEmpty ? "" : "${_chatController.text}\n";
+          _chatController.text = "$prefix\n[附件分析提取内容]:\n$extractedText\n\n(请输入您的针对性问题...)";
+        }
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("文件提取失败: $e")));
+      } finally {
+        setState(() => _isProcessingImage = false);
+      }
+    }
+  }
+
   Future<void> _sendMessage() async {
     final text = _chatController.text.trim();
     if (text.isEmpty || _isReplying) return;
@@ -94,31 +128,55 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
     });
     _scrollToBottom();
 
-    // 1. 进行 RAG 知识检索获取上下文
-    String relevantContext = widget.exam.knowledgeBase;
     final embeddingModel = await ConfigService.getEmbeddingModel();
     final lmUrl = await ConfigService.getLmStudioUrl();
     
-    if (embeddingModel.isNotEmpty && relevantContext.length > 600) {
-      AppLogger.log("Q&A 触发语义检索...");
-      relevantContext = await SemanticRetrievalService.getRelevantContext(
-        widget.exam.knowledgeBase, text, embeddingModel, lmUrl,
-      );
-    }
+    List<String> retrievedChunks =[];
+    String relevantContext = "";
 
-    // 2. 调用大模型回答
-    String aiResponse = await DualAIService.answerQuestionWithContext(text, relevantContext);
+    try {
+      // 1. 强制依赖 Embedding 模型保障底层防溢出
+      if (embeddingModel.isEmpty) {
+        relevantContext = "[系统异常提示：未配置 Embedding 模型。为了避免触发 400 上下文溢出崩溃，系统已阻断此次全量文本请求。请前往设置页绑定大模型。]";
+      } else if (widget.exam.id != null) {
+        AppLogger.log("Q&A 触发本地 SQLite 向量库检索机制...");
+        // 2. 从无限的 SQLite 库中提取 Top-5 的 Chunk 块
+        retrievedChunks = await SemanticRetrievalService.searchContext(
+          widget.exam.id!, text, embeddingModel, lmUrl,
+        );
+        
+        if (retrievedChunks.isNotEmpty) {
+          // Top-5 的分块（每块约 600 字符）总计在 3000 字左右，天然保证绝对安全
+          relevantContext = retrievedChunks.join("\n\n");
+        } else {
+          relevantContext = "[未能在向量数据库中命中高相关度内容，请依据模型基础认知尝试回答。]";
+        }
+      }
 
-    if (mounted) {
-      setState(() {
-        _messages.add(ChatMessage(role: 'ai', text: aiResponse));
-        _isReplying = false;
-      });
-      _scrollToBottom();
+      // 3. 将经过精密组装的安全 Context 下发给大模型进行对话
+      String aiResponse = await DualAIService.answerQuestionWithContext(text, relevantContext);
+
+      // 4. 将提取出的来源碎片附带到 UI 进行渲染，方便溯源防幻觉
+      if (mounted) {
+        setState(() {
+          _messages.add(ChatMessage(role: 'ai', text: aiResponse, sourceChunks: retrievedChunks));
+          _isReplying = false;
+        });
+        _scrollToBottom();
+      }
+    } catch (e) {
+      AppLogger.log("Q&A 交互处理链路异常: $e", isError: true);
+      if (mounted) {
+        setState(() {
+          _messages.add(ChatMessage(role: 'ai', text: "请求由于内部异常中断：$e"));
+          _isReplying = false;
+        });
+        _scrollToBottom();
+      }
     }
   }
 
-  // --- [迁移集成] DAG 辅助理解生成系统 ---
+  // --- DAG生成等逻辑保持之前的不变 ---
   Future<void> _generateDAG() async {
     final text = widget.exam.knowledgeBase.trim();
     if (text.isEmpty) {
@@ -225,8 +283,40 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
                               bottomRight: Radius.circular(isUser ? 0 : 16),
                             ),
                           ),
-                          // 核心：使用 Markdown 引擎渲染回复
-                          child: _renderMarkdown(msg.text, isSelectable: true, shrinkWrap: true),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _renderMarkdown(msg.text, isSelectable: true, shrinkWrap: true),
+                              
+                              // [新增溯源 UI] 如果包含参考切片数据，展示折叠面板
+                              if (msg.sourceChunks != null && msg.sourceChunks!.isNotEmpty) ...[
+                                const SizedBox(height: 12),
+                                Theme(
+                                  data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                                  child: ExpansionTile(
+                                    tilePadding: EdgeInsets.zero,
+                                    title: Text(
+                                      "🔍 本次回答共参考 ${msg.sourceChunks!.length} 个本地向量条目",
+                                      style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary),
+                                    ),
+                                    children: msg.sourceChunks!.map((chunk) => Container(
+                                      margin: const EdgeInsets.only(bottom: 8),
+                                      padding: const EdgeInsets.all(8),
+                                      decoration: BoxDecoration(
+                                        color: Theme.of(context).colorScheme.surface,
+                                        border: Border.all(color: Colors.grey.withOpacity(0.3)),
+                                        borderRadius: BorderRadius.circular(6)
+                                      ),
+                                      child: SelectableText(
+                                        chunk,
+                                        style: const TextStyle(fontSize: 11, fontStyle: FontStyle.italic),
+                                      ),
+                                    )).toList(),
+                                  ),
+                                )
+                              ]
+                            ],
+                          ),
                         ),
                       ),
                       if (isUser) ...[
@@ -240,31 +330,44 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
             ),
           ),
           if (_isReplying)
-            const Padding(
-              padding: EdgeInsets.all(8.0),
-              child: Text("AI 导师正在查阅资料并思考...", style: TextStyle(color: Colors.grey, fontStyle: FontStyle.italic)),
-            ),
+            const Padding(padding: EdgeInsets.all(8.0), child: Text("AI 导师正在查阅资料并思考...", style: TextStyle(color: Colors.grey, fontStyle: FontStyle.italic))),
+          
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: Theme.of(context).scaffoldBackgroundColor,
               border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
             ),
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
+                // [新增] 多模态文件入口
+                IconButton(
+                  icon: _isProcessingImage 
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.attach_file, color: Colors.blueGrey),
+                  tooltip: "提取图片或文档内容",
+                  onPressed: _isProcessingImage || _isReplying ? null : _handleFileAttachment,
+                ),
+                const SizedBox(width: 8),
                 Expanded(
                   child: TextField(
                     controller: _chatController,
-                    maxLines: 3, minLines: 1,
-                    decoration: const InputDecoration(hintText: "就当前知识库提出疑问...", border: OutlineInputBorder()),
-                    onSubmitted: (_) => _sendMessage(),
+                    maxLines: 6, minLines: 1,
+                    decoration: const InputDecoration(
+                      hintText: "就当前知识库提出疑问，或输入附件解析后提问...", 
+                      border: OutlineInputBorder()
+                    ),
                   ),
                 ),
                 const SizedBox(width: 12),
-                FilledButton(
-                  onPressed: _isReplying ? null : _sendMessage,
-                  style: FilledButton.styleFrom(shape: const CircleBorder(), padding: const EdgeInsets.all(16)),
-                  child: const Icon(Icons.send),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4.0),
+                  child: FilledButton(
+                    onPressed: _isReplying ? null : _sendMessage,
+                    style: FilledButton.styleFrom(shape: const CircleBorder(), padding: const EdgeInsets.all(16)),
+                    child: const Icon(Icons.send),
+                  ),
                 )
               ],
             ),
@@ -274,6 +377,7 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
     );
   }
 }
+
 // ==========================================
 // 附加服务：Markdown与LaTeX动态渲染器
 // ==========================================
@@ -524,90 +628,128 @@ class ExamRecord {
   Map<String, dynamic> get parsedFeedbacks => jsonDecode(aiFeedbackJson);
 }
 
-// ==========================================
-// 3. 数据层 - SQLite 数据库
-// ==========================================
-class DatabaseHelper {
-  static Database? _database;
-  static Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDB();
-    return _database!;
-  }
+  // ==========================================
+  // 3. 数据层 - SQLite 数据库 (修改片段)
+  // ==========================================
+  class DatabaseHelper {
+    static Database? _database;
+    static Future<Database> get database async {
+      if (_database != null) return _database!;
+      _database = await _initDB();
+      return _database!;
+    }
 
-  static Future<Database> _initDB() async {
-    final docDir = io.Directory('${io.Platform.environment['HOME']}/.ai_teacher');
-    if (!await docDir.exists()) await docDir.create(recursive: true);
-    String dbPath = path.join(docDir.path, 'exams_v2.db'); 
+    static Future<Database> _initDB() async {
+      final docDir = io.Directory('${io.Platform.environment['HOME']}/.ai_teacher');
+      if (!await docDir.exists()) await docDir.create(recursive: true);
+      String dbPath = path.join(docDir.path, 'exams_v2.db'); 
+      
+      // [修改] 版本升级至 3，引入 exam_embeddings 表用于持久化本地向量缓存
+      return await openDatabase(dbPath, version: 3, onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE saved_exams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            examJson TEXT NOT NULL,
+            knowledgeBase TEXT NOT NULL,
+            createdAt INTEGER NOT NULL
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE exam_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            examId INTEGER NOT NULL,
+            score INTEGER NOT NULL,
+            userAnswersJson TEXT NOT NULL,
+            aiFeedbackJson TEXT NOT NULL,
+            createdAt INTEGER NOT NULL,
+            FOREIGN KEY (examId) REFERENCES saved_exams (id) ON DELETE CASCADE
+          )
+        ''');
+        // [新增] 本地向量索引表
+        await db.execute('''
+          CREATE TABLE exam_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            examId INTEGER NOT NULL,
+            chunkText TEXT NOT NULL,
+            vectorJson TEXT NOT NULL,
+            FOREIGN KEY (examId) REFERENCES saved_exams (id) ON DELETE CASCADE
+          )
+        ''');
+      }, onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('ALTER TABLE saved_exams ADD COLUMN knowledgeBase TEXT DEFAULT ""');
+        }
+        if (oldVersion < 3) {
+          await db.execute('''
+            CREATE TABLE exam_embeddings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              examId INTEGER NOT NULL,
+              chunkText TEXT NOT NULL,
+              vectorJson TEXT NOT NULL,
+              FOREIGN KEY (examId) REFERENCES saved_exams (id) ON DELETE CASCADE
+            )
+          ''');
+        }
+      });
+    }
+
+    static Future<int> saveExam(SavedExam exam) async {
+      final db = await database;
+      return await db.insert('saved_exams', exam.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+
+    static Future<List<SavedExam>> getAllExams() async {
+      final db = await database;
+      final maps = await db.query('saved_exams', orderBy: 'createdAt DESC');
+      return maps.map((m) => SavedExam.fromMap(m)).toList();
+    }
+
+    static Future<void> saveExamRecord(ExamRecord record) async {
+      final db = await database;
+      await db.insert('exam_records', record.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+
+    static Future<List<ExamRecord>> getRecordsForExam(int examId) async {
+      final db = await database;
+      final maps = await db.query('exam_records', where: 'examId = ?', whereArgs: [examId], orderBy: 'createdAt DESC');
+      return maps.map((m) => ExamRecord.fromMap(m)).toList();
+    }
+
+    static Future<void> deleteExam(int id) async {
+      final db = await database;
+      await db.delete('saved_exams', where: 'id = ?', whereArgs: [id]);
+    }
+
+    /// 更新已保存的测验数据（主要用于修改知识库原始文本）
+    static Future<int> updateExam(SavedExam exam) async {
+      final db = await database;
+      return await db.update(
+        'saved_exams',
+        exam.toMap(),
+        where: 'id = ?',
+        whereArgs: [exam.id],
+      );
+    }
     
-    // 版本升级至 2，支持历史数据热迁移
-    return await openDatabase(dbPath, version: 2, onCreate: (db, version) async {
-      await db.execute('''
-        CREATE TABLE saved_exams (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          title TEXT NOT NULL,
-          examJson TEXT NOT NULL,
-          knowledgeBase TEXT NOT NULL,
-          createdAt INTEGER NOT NULL
-        )
-      ''');
-      await db.execute('''
-        CREATE TABLE exam_records (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          examId INTEGER NOT NULL,
-          score INTEGER NOT NULL,
-          userAnswersJson TEXT NOT NULL,
-          aiFeedbackJson TEXT NOT NULL,
-          createdAt INTEGER NOT NULL,
-          FOREIGN KEY (examId) REFERENCES saved_exams (id) ON DELETE CASCADE
-        )
-      ''');
-    }, onUpgrade: (db, oldVersion, newVersion) async {
-      if (oldVersion < 2) {
-        // V1 到 V2 升级，追加知识库列
-        await db.execute('ALTER TABLE saved_exams ADD COLUMN knowledgeBase TEXT DEFAULT ""');
-      }
-    });
-  }
+    // [新增] 向量库持久化接口
+    static Future<void> saveEmbeddings(int examId, List<Map<String, dynamic>> embeddings) async {
+      final db = await database;
+      await db.transaction((txn) async {
+        // 每次保存前清空该题库的旧向量
+        await txn.delete('exam_embeddings', where: 'examId = ?', whereArgs: [examId]);
+        for (var e in embeddings) {
+          await txn.insert('exam_embeddings', e);
+        }
+      });
+    }
 
-  static Future<int> saveExam(SavedExam exam) async {
-    final db = await database;
-    return await db.insert('saved_exams', exam.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    // [新增] 获取某题库的所有向量数据
+    static Future<List<Map<String, dynamic>>> getEmbeddingsForExam(int examId) async {
+      final db = await database;
+      return await db.query('exam_embeddings', where: 'examId = ?', whereArgs: [examId]);
+    }
   }
-
-  static Future<List<SavedExam>> getAllExams() async {
-    final db = await database;
-    final maps = await db.query('saved_exams', orderBy: 'createdAt DESC');
-    return maps.map((m) => SavedExam.fromMap(m)).toList();
-  }
-
-  static Future<void> saveExamRecord(ExamRecord record) async {
-    final db = await database;
-    await db.insert('exam_records', record.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
-  }
-
-  static Future<List<ExamRecord>> getRecordsForExam(int examId) async {
-    final db = await database;
-    final maps = await db.query('exam_records', where: 'examId = ?', whereArgs: [examId], orderBy: 'createdAt DESC');
-    return maps.map((m) => ExamRecord.fromMap(m)).toList();
-  }
-
-  static Future<void> deleteExam(int id) async {
-    final db = await database;
-    await db.delete('saved_exams', where: 'id = ?', whereArgs: [id]);
-  }
-
-  /// 更新已保存的测验数据（主要用于修改知识库原始文本）
-  static Future<int> updateExam(SavedExam exam) async {
-    final db = await database;
-    return await db.update(
-      'saved_exams',
-      exam.toMap(),
-      where: 'id = ?',
-      whereArgs: [exam.id],
-    );
-  }
-}
 
 // ==========================================
 // 4. 服务层 - 双模型 AI 流水线 (包含埋点与防超时)
@@ -924,14 +1066,14 @@ $question
 }
 
 // ==========================================
-// 4. 服务层 - 附加轻量级向量检索服务 (修复版)
+// 4. 服务层 - 附加轻量级向量检索服务 (修改片段)
 // ==========================================
 class SemanticRetrievalService {
   static final Dio _dio = Dio();
 
   static List<String> _chunkText(String text, {int chunkSize = 600, int overlap = 100}) {
     if (text.length <= chunkSize) return [text];
-    List<String> chunks =[];
+    List<String> chunks = [];
     int start = 0;
     while (start < text.length) {
       int end = start + chunkSize;
@@ -953,65 +1095,65 @@ class SemanticRetrievalService {
     return dotProduct / (math.sqrt(normA) * math.sqrt(normB));
   }
 
-  /// 修复版 RAG 检索：采用串行处理切片以适应本地小模型，并实时回传进度
-  static Future<String> getRelevantContext(
-    String rawText, 
-    String query, 
-    String model, 
-    String baseUrl,
-    {Function(String status, double progress)? onProgress}
-  ) async {
-    if (model.isEmpty) return rawText;
-
-    onProgress?.call("正在进行文本语义分块 (Chunking)...", 0.05);
-    // 降低 chunk 尺寸以确保绝不会超出 2048 token 的小模型限制
-    final chunks = _chunkText(rawText, chunkSize: 600, overlap: 100);
-    AppLogger.log("文本已切分为 ${chunks.length} 个切片");
-
-    List<List<double>> chunkEmbeddings =[];
+  /// [新增] 持久化构建本地向量索引（由知识库保存时触发）
+  static Future<void> buildAndSaveIndex(int examId, String rawText, String model, String baseUrl, {Function(String, double)? onProgress}) async {
+    if (model.isEmpty || rawText.isEmpty) return;
     
-    // 采用串行逐一请求代替批量请求，解决本地模型不支持 Batching 的问题
+    onProgress?.call("正在进行文本语义分块...", 0.1);
+    final chunks = _chunkText(rawText);
+    List<Map<String, dynamic>> dbRecords = [];
+
     for (int i = 0; i < chunks.length; i++) {
-      onProgress?.call("本地 Embedding 向量化: 第 ${i + 1}/${chunks.length} 块", 0.05 + 0.8 * (i / chunks.length));
+      onProgress?.call("本地 Embedding 向量化: 第 ${i + 1}/${chunks.length} 块", 0.1 + 0.8 * (i / chunks.length));
       try {
         final response = await _dio.post(
           '$baseUrl/embeddings',
-          data: {"model": model, "input": chunks[i]}, // 单个 String 而非 List
+          data: {"model": model, "input": chunks[i]},
           options: Options(receiveTimeout: const Duration(seconds: 30)),
         );
-        chunkEmbeddings.add(List<double>.from(response.data['data'][0]['embedding']));
+        final vector = List<double>.from(response.data['data'][0]['embedding']);
+        dbRecords.add({
+          'examId': examId,
+          'chunkText': chunks[i],
+          'vectorJson': jsonEncode(vector), // 转为 JSON 字符串入库
+        });
       } catch (e) {
         AppLogger.log("第 $i 块 Embedding 失败: $e", isError: true);
-        // 如果出错，注入一个空的占位向量防止后续对齐奔溃
-        chunkEmbeddings.add(List<double>.filled(1536, 0.0)); 
       }
     }
+    
+    onProgress?.call("正在写入本地 SQLite 向量库...", 0.95);
+    await DatabaseHelper.saveEmbeddings(examId, dbRecords);
+    AppLogger.log("✅ 题库 ID:$examId 的向量索引构建完成，共存入 ${dbRecords.length} 个切片。");
+  }
 
-    onProgress?.call("正在生成用户主题的参考向量...", 0.90);
-    List<double> queryVector =[];
+  /// [修改] 检索时直接利用 SQLite 内的向量进行余弦匹配，并返回原文 List<String> 供 UI 溯源展示
+  static Future<List<String>> searchContext(int examId, String query, String model, String baseUrl) async {
+    if (model.isEmpty) return [];
+
+    List<Map<String, dynamic>> savedVectors = await DatabaseHelper.getEmbeddingsForExam(examId);
+    if (savedVectors.isEmpty) return [];
+
+    List<double> queryVector = [];
     try {
       final qRes = await _dio.post('$baseUrl/embeddings', data: {"model": model, "input": query});
       queryVector = List<double>.from(qRes.data['data'][0]['embedding']);
     } catch (e) {
       AppLogger.log("主题向量生成失败: $e", isError: true);
-      return rawText; // 彻底失败则回退全量
+      return [];
     }
 
-    onProgress?.call("正在计算余弦相似度并排序...", 0.95);
-    List<MapEntry<String, double>> scoredChunks =[];
-    for (int i = 0; i < chunks.length; i++) {
-      final sim = _cosineSimilarity(queryVector, chunkEmbeddings[i]);
-      scoredChunks.add(MapEntry(chunks[i], sim));
+    List<MapEntry<String, double>> scoredChunks = [];
+    for (var record in savedVectors) {
+      List<double> chunkVec = List<double>.from(jsonDecode(record['vectorJson']));
+      double sim = _cosineSimilarity(queryVector, chunkVec);
+      scoredChunks.add(MapEntry(record['chunkText'] as String, sim));
     }
     
     scoredChunks.sort((a, b) => b.value.compareTo(a.value));
     
-    // 提取最相关的前 5 个片段
     int maxSelected = math.min(5, scoredChunks.length);
-    List<String> selectedChunks = scoredChunks.take(maxSelected).map((e) => e.key).toList();
-
-    onProgress?.call("上下文检索优化完成！", 1.0);
-    return selectedChunks.join("\n\n");
+    return scoredChunks.take(maxSelected).map((e) => e.key).toList();
   }
 }
 
@@ -1038,6 +1180,7 @@ class ExamProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  // [终极修复] 通过无限存储 + 动态精准切片组装，彻底规避 400 崩溃
   Future<bool> processAndGenerate({
     required String rawText, required String topic, required int count, required String difficulty,
   }) async {
@@ -1045,41 +1188,49 @@ class ExamProvider extends ChangeNotifier {
     _errorMessage = "";
     _updateProgress("引擎启动中...", 0.0);
 
-    int? currentExamId; 
-
     try {
       if ((await ConfigService.getDeepSeekKey()).isEmpty) throw Exception("请先在设置中配置云端 API Key");
-
-      _updateProgress("正在将原始知识库即时持久化...", 0.02);
-      final provisionalExam = SavedExam(title: topic, examJson: "[]", knowledgeBase: rawText, createdAt: DateTime.now().millisecondsSinceEpoch);
-      currentExamId = await DatabaseHelper.saveExam(provisionalExam);
-
-      String processedText = rawText;
+      
       final embeddingModel = await ConfigService.getEmbeddingModel();
       final lmUrl = await ConfigService.getLmStudioUrl();
-      
-      // 优化：不再使用字符长度卡死，只要有 embedding 模型且文本超过单块容量(600)即触发
-      if (embeddingModel.isNotEmpty && rawText.length > 600) {
-        processedText = await SemanticRetrievalService.getRelevantContext(
-          rawText, topic, embeddingModel, lmUrl,
-          onProgress: (status, progress) => _updateProgress(status, progress)
-        );
+      if (embeddingModel.isEmpty) {
+        throw Exception("🚨 为了保障超长文本处理的绝对稳定，必须前置配置 Embedding 模型进行向量化！请前往设置填写。");
       }
 
+      _updateProgress("正在将海量原始知识库全量持久化...", 0.02);
+      final provisionalExam = SavedExam(title: topic, examJson: "[]", knowledgeBase: rawText, createdAt: DateTime.now().millisecondsSinceEpoch);
+      int currentExamId = await DatabaseHelper.saveExam(provisionalExam);
+
+      // 1. 无限切片并建立向量树索引：不受文本总长度限制，依靠 SQLite 处理海量切块
+      _updateProgress("正在进行文本碎片化与向量树重构...", 0.10);
+      await SemanticRetrievalService.buildAndSaveIndex(currentExamId, rawText, embeddingModel, lmUrl, onProgress: _updateProgress);
+
+      // 2. 动态精准拼装上下文：利用主题词提取 Top-5 知识域切片 (数学期望字数 < 3000)，完美兼容 4096 Tokens 限制
+      _updateProgress("正在从向量库提取 '$topic' 的高维特征片段...", 0.90);
+      final chunks = await SemanticRetrievalService.searchContext(currentExamId, topic, embeddingModel, lmUrl);
+      String processedText = chunks.join("\n\n");
+      
+      // Fallback: 兜底保护
+      if (processedText.isEmpty) {
+        throw Exception("未能从数据库中提取到有效切片，请检查向量模型是否工作正常。");
+      }
+
+      // 3. 执行安全的本地 Rerank
       final enableRerank = await ConfigService.getEnableRerank();
       if (enableRerank) {
-        _updateProgress("正在执行 Rerank 精细重排序...", 1.0); // 进度条拉满进入模型推理状态
+        _updateProgress("正在执行 Rerank 精细重排序...", 0.95); 
         processedText = await DualAIService._rerankContent(processedText);
       }
       
-      _updateProgress("正在请求云端大模型构建结构化试卷...", 1.0); // 变为无尽等待状态
+      // 4. 发送至出题引擎，此时上下文经过精准拼装，绝对安全
+      _updateProgress("上下文组装完成，请求云端构建试卷...", 1.0); 
       final result = await DualAIService.generateMixedExam(
         contextText: processedText, topic: topic, count: count, difficulty: difficulty,
       );
 
       if (result.containsKey("error")) throw Exception(result["error"]);
 
-      _updateProgress("正在持久化最终考题...", 1.0);
+      _updateProgress("试卷构建完毕，正在持久化...", 1.0);
       final examJsonStr = jsonEncode(result['questions'] ??[]);
 
       final finalExam = SavedExam(id: currentExamId, title: topic, examJson: examJsonStr, knowledgeBase: rawText, createdAt: provisionalExam.createdAt);
@@ -1225,8 +1376,19 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("AI 互动助教"),
-        actions:[
+        title: const Text("AI 互动助教 工作台"),
+        actions: [
+          // [新增] 显式的亮色/暗色主题切换
+          Consumer<ThemeProvider>(
+            builder: (context, themeProvider, child) {
+              bool isDark = Theme.of(context).brightness == Brightness.dark;
+              return IconButton(
+                icon: Icon(isDark ? Icons.light_mode : Icons.dark_mode, color: isDark ? Colors.amber : Colors.indigo),
+                tooltip: "切换主题",
+                onPressed: () => themeProvider.toggleTheme(!isDark),
+              );
+            },
+          ),
           IconButton(icon: const Icon(Icons.settings), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()))),
         ],
       ),
@@ -1665,19 +1827,22 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   final TextEditingController _textController = TextEditingController();
   int _questionCount = 5;
 
-  bool _isProcessingFiles = false;
+  // --- 升级的状态机：异步任务队列与游标 ---
+  bool _isProcessingQueue = false;
+  final List<io.File> _fileQueue = [];
   int _totalFilesToProcess = 0;
   int _processedFilesCount = 0;
+
   bool _enableOCR = true;
   final String _ocrModel = "vision-model";
   bool _useNativePDF = true;
 
   final List<String> _logLines = ["[INFO] 系统已就绪，等待交互..."];
   final ScrollController _logScrollController = ScrollController();
-  bool _isLogPanelExpanded = false;
   StreamSubscription? _logSubscription;
+  bool _isLogPanelExpanded = false;
 
-  bool get _isEditMode => widget.existingExam != null; // 判定标志
+  bool get _isEditMode => widget.existingExam != null;
 
   @override
   void initState() {
@@ -1724,78 +1889,152 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   }
 
   // ==========================================
-  // 文件批量处理与视觉识别流
+  // [新增] 特性 1 & 4: 底层文本解码与 Word 文档解析 (Debian 13 原生优化)
   // ==========================================
-  Future<void> _importFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.custom, 
-      allowedExtensions:['txt', 'md', 'json', 'png', 'jpg', 'jpeg', 'pdf'],
-      allowMultiple: true, 
-    );
-    
-    if (result != null && result.files.isNotEmpty) {
-      setState(() {
-        _isProcessingFiles = true;
-        _totalFilesToProcess = result.files.length;
-        _processedFilesCount = 0;
-        _isLogPanelExpanded = true; 
-      });
-      _scrollToBottom();
-      
-      AppLogger.log("📥 开始批量导入 $_totalFilesToProcess 个文件");
-      AppLogger.log("📊 多模态模型配置: 启用=$_enableOCR, 模型=$_ocrModel, 原生PDF=$_useNativePDF");
-      
-      for (int i = 0; i < result.files.length; i++) {
-        var file = result.files[i];
-        String filePath = file.path!;
-        String ext = path.extension(filePath).toLowerCase();
-
-        String content = "";
-        try {
-          if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
-            if (_enableOCR) {
-              AppLogger.log("🔍 对图片文件 ${file.name} 启用多模态模型识别");
-              content = await DualAIService.performLocalOCR(filePath);
-            } else {
-              AppLogger.log("⚠️  多模态模型已禁用，跳过图片文件 ${file.name}");
-              content = "[图片文件，多模态模型已禁用]";
-            }
-          } else if (ext == '.pdf') {
-            if (_enableOCR) {
-              AppLogger.log("🔍 对 PDF 文件 ${file.name} 启用多模态模型识别");
-              if (_useNativePDF && (io.Platform.isLinux || io.Platform.isWindows || io.Platform.isMacOS)) {
-                try { 
-                  content = await _parsePdfWithOCR(filePath); 
-                  AppLogger.log("✅ PDF 原生解析成功: ${file.name}");
-                } catch (e) { 
-                  AppLogger.log("⚠️  PDF 原生解析失败，回退到视觉模型: $e", isError: true);
-                  content = await DualAIService.performLocalOCR(filePath); 
-                }
-              } else {
-                content = await DualAIService.performLocalOCR(filePath);
-              }
-            } else {
-              AppLogger.log("⚠️  多模态模型已禁用，跳过 PDF 文件 ${file.name}");
-              content = "[PDF 文件，多模态模型已禁用]";
-            }
-          } else {
-            content = await io.File(filePath).readAsString();
-            AppLogger.log("📄 文本文件 ${file.name} 读取成功，长度: ${content.length} 字符");
+  Future<String> _readTextFileSmart(String filePath) async {
+    try {
+      // 尝试标准 UTF-8 解码
+      return await io.File(filePath).readAsString();
+    } catch (e) {
+      AppLogger.log("⚠️ 检测到非标准 UTF-8 编码，触发底层 iconv 转换探测: ${path.basename(filePath)}");
+      try {
+        final encRes = await io.Process.run('file', ['-b', '--mime-encoding', filePath]);
+        String charset = encRes.stdout.toString().trim();
+        
+        if (charset.isNotEmpty && charset != 'binary') {
+          final iconvRes = await io.Process.run('iconv', ['-f', charset, '-t', 'utf-8', filePath]);
+          if (iconvRes.exitCode == 0) {
+            AppLogger.log("✅ 成功将 $charset 转换为 UTF-8");
+            return iconvRes.stdout.toString();
           }
-        } catch (e) {
-          content = "\n[文件 ${file.name} 解析失败: $e]";
-          AppLogger.log("❌ 文件 ${file.name} 解析失败: $e", isError: true);
         }
+        return "\n[文件解码失败: 不受支持的底层编码 ($charset) 或乱码]";
+      } catch (osError) {
+        return "\n[操作系统级解码异常: $osError]";
+      }
+    }
+  }
 
+  Future<String> _parseWordDocument(String filePath, String ext) async {
+    try {
+      if (ext == '.docx') {
+        // 利用 unzip 与 sed 高速剥离 XML (无需依赖额外的 Office 套件)
+        final res = await io.Process.run('sh', ['-c', 'unzip -p "$filePath" word/document.xml | sed -e "s/<[^>]*>//g"']);
+        if (res.exitCode == 0) return res.stdout.toString();
+        throw Exception(res.stderr.toString());
+      } else if (ext == '.doc') {
+        // 针对遗留 doc 格式，依赖轻量的 antiword (Debian: sudo apt install antiword)
+        final res = await io.Process.run('antiword', [filePath]);
+        if (res.exitCode == 0) return res.stdout.toString();
+        throw Exception("需要 antiword 依赖，请在终端执行: sudo apt-get install antiword");
+      }
+      return "";
+    } catch (e) {
+      AppLogger.log("❌ Word 文件解析异常 ($ext): $e", isError: true);
+      return "\n[Word 解析失败: $e]";
+    }
+  }
+
+  // ==========================================
+  // [新增] 特性 2 & 3: 异步队列调度引擎与文件夹遍历
+  // ==========================================
+  Future<void> _processFileQueue() async {
+    if (_isProcessingQueue) return; // 互斥锁，确保队列消费者单例运行
+    setState(() => _isProcessingQueue = true);
+
+    while (_fileQueue.isNotEmpty) {
+      // 消费队列顶端任务
+      final file = _fileQueue.removeAt(0);
+      String filePath = file.path;
+      String ext = path.extension(filePath).toLowerCase();
+      String content = "";
+
+      AppLogger.log("⚙️ 正在解析 (${_processedFilesCount + 1}/$_totalFilesToProcess): ${path.basename(filePath)}");
+
+      try {
+        if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
+          content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[图片文件，多模态模型已禁用]";
+        } else if (ext == '.pdf') {
+          if (_enableOCR) {
+            content = (_useNativePDF && io.Platform.isLinux) 
+              ? await _parsePdfWithOCR(filePath) // 内部有 fallback
+              : await DualAIService.performLocalOCR(filePath);
+          } else {
+            content = "[PDF 文件，多模态模型已禁用]";
+          }
+        } else if (ext == '.doc' || ext == '.docx') {
+          content = await _parseWordDocument(filePath, ext);
+        } else {
+          // 纯文本/JSON/Markdown/代码 等文件走智能编码探测
+          content = await _readTextFileSmart(filePath);
+        }
+      } catch (e) {
+        content = "\n[文件 ${path.basename(filePath)} 未知异常: $e]";
+      }
+
+      // 将提取的内容注入文本框
+      if (mounted) {
         setState(() {
           final prefix = _textController.text.isEmpty ? "" : "\n\n";
-          _textController.text += "$prefix--- 📄 文件来源: ${file.name} ---\n$content";
+          _textController.text += "$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content";
           _processedFilesCount++;
         });
       }
       
-      setState(() => _isProcessingFiles = false);
-      AppLogger.log("✅ 队列全部解析完毕，准备就绪。");
+      // 让出事件循环，避免卡死 UI 并允许用户输入新的文件
+      await Future.delayed(const Duration(milliseconds: 100)); 
+    }
+
+    // 队列清空，关闭流水线
+    if (mounted) {
+      setState(() => _isProcessingQueue = false);
+      AppLogger.log("✅ 队列中所有文件已全部映射到知识库完成。");
+    }
+  }
+
+  void _addFilesToQueue(List<io.File> files) {
+    if (files.isEmpty) return;
+    setState(() {
+      _fileQueue.addAll(files);
+      _totalFilesToProcess += files.length;
+      if (!_isLogPanelExpanded) _isLogPanelExpanded = true;
+    });
+    AppLogger.log("📥 队列新增 ${files.length} 个任务，当前队列积压 ${_fileQueue.length} 个任务");
+    _scrollToBottom();
+    _processFileQueue(); // 尝试启动或激活消费者
+  }
+
+  Future<void> _pickFiles() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom, 
+      allowedExtensions: ['txt', 'md', 'json', 'csv', 'png', 'jpg', 'jpeg', 'pdf', 'doc', 'docx'],
+      allowMultiple: true, 
+    );
+    if (result != null) {
+      _addFilesToQueue(result.paths.where((p) => p != null).map((p) => io.File(p!)).toList());
+    }
+  }
+
+  Future<void> _pickFolder() async {
+    String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
+    if (selectedDirectory != null) {
+      AppLogger.log("📂 正在扫描目录结构: $selectedDirectory");
+      final dir = io.Directory(selectedDirectory);
+      final validExts = ['.txt', '.md', '.json', '.csv', '.png', '.jpg', '.jpeg', '.pdf', '.doc', '.docx'];
+      
+      List<io.File> collectedFiles = [];
+      try {
+        final stream = dir.list(recursive: true, followLinks: false);
+        await for (var entity in stream) {
+          if (entity is io.File) {
+            String ext = path.extension(entity.path).toLowerCase();
+            if (validExts.contains(ext)) collectedFiles.add(entity);
+          }
+        }
+        _addFilesToQueue(collectedFiles);
+      } catch (e) {
+        AppLogger.log("⚠️ 目录扫描异常: $e", isError: true);
+      }
     }
   }
 
@@ -1833,38 +2072,10 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     if (_topicController.text.trim().isEmpty || _textController.text.trim().isEmpty) return;
     
     if (_isEditMode) {
-      // ==== 编辑模式：执行原 KnowledgeEditScreen 的保存与 Rerank 逻辑 ====
-      setState(() => _isProcessingFiles = true);
+      setState(() => _isProcessingQueue = true);
       String finalText = _textController.text.trim();
       
-      final enableRerank = await ConfigService.getEnableRerank();
-      if (enableRerank) {
-        final rerankModel = await ConfigService.getRerankModel();
-        if (rerankModel.isNotEmpty) {
-          AppLogger.log("启动 Rerank 优化模型处理知识库文本...");
-          try {
-            final localUrl = await ConfigService.getLmStudioUrl();
-            final response = await Dio().post(
-              '$localUrl/chat/completions',
-              options: Options(receiveTimeout: const Duration(minutes: 5)),
-              data: {
-                "model": rerankModel, 
-                "messages":[
-                  {"role": "system", "content": "你是一个文本重排序专家。请对输入的文本进行重新排序，将最重要的内容放在前面，按重要性递减的顺序排列。"},
-                  {"role": "user", "content": "请对以下文本进行重排序：\n\n文本：$finalText"}
-                ],
-                "temperature": 0.1,
-              },
-            );
-            final usage = response.data['usage'];
-            AppLogger.log("Rerank 处理完毕，消耗 Tokens: [Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
-            finalText = response.data['choices'][0]['message']['content'];
-          } catch (e) {
-            AppLogger.log("Rerank 模型返回异常，使用原始文本保存", isError: true);
-          }
-        }
-      }
-      
+      // 触发持久化
       final updatedExam = SavedExam(
         id: widget.existingExam!.id,
         title: _topicController.text.trim(),
@@ -1873,10 +2084,20 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         createdAt: widget.existingExam!.createdAt,
       );
       await DatabaseHelper.updateExam(updatedExam);
+
+      // [新增逻辑] 覆写向量索引
+      final embeddingModel = await ConfigService.getEmbeddingModel();
+      final lmUrl = await ConfigService.getLmStudioUrl();
+      if (embeddingModel.isNotEmpty) {
+        AppLogger.log("触发数据库热更新，正在重建 Embedding 向量树...");
+        await SemanticRetrievalService.buildAndSaveIndex(
+          updatedExam.id!, finalText, embeddingModel, lmUrl,
+        );
+      }
       
       if (mounted) {
-        setState(() => _isProcessingFiles = false);
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 知识库数据已成功更新")));
+        setState(() => _isProcessingQueue = false);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 知识库及其向量索引已成功更新")));
         Navigator.pop(context);
       }
     } else {
@@ -1916,17 +2137,20 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                   const SizedBox(width: 8),
                   const Text("模型状态与数据库日志", style: TextStyle(fontWeight: FontWeight.bold)),
                   const Spacer(),
-                  if (_isProcessingFiles) ...[
+                  if (_isProcessingQueue) ...[
                     SizedBox(width: 100, child: LinearProgressIndicator(value: progress)),
                     const SizedBox(width: 12),
                     Text(
-                      "文件处理中: $_processedFilesCount/$_totalFilesToProcess", 
+                      "流水线运行中: $_processedFilesCount/$_totalFilesToProcess", 
                       style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary)
                     ),
                   ] else ...[
                     const Icon(Icons.circle, size: 10, color: Colors.green),
                     const SizedBox(width: 6),
-                    const Text("引擎空闲", style: TextStyle(fontSize: 12, color: Colors.green)),
+                    Text(
+                      _totalFilesToProcess > 0 ? "全部完成 ($_totalFilesToProcess)" : "引擎空闲", 
+                      style: const TextStyle(fontSize: 12, color: Colors.green)
+                    ),
                   ]
                 ],
               ),
@@ -2017,10 +2241,21 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween, 
                       children:[
                         const Text("导入知识域", style: TextStyle(fontWeight: FontWeight.bold)),
-                        TextButton.icon(
-                          icon: const Icon(Icons.drive_folder_upload), 
-                          label: const Text("批量导入文件"), 
-                          onPressed: _isProcessingFiles ? null : _importFile
+                        // [修改] 提供文件和文件夹的多重入口
+                        Row(
+                          children: [
+                            TextButton.icon(
+                              icon: const Icon(Icons.create_new_folder), 
+                              label: const Text("扫描文件夹"), 
+                              onPressed: _pickFolder,
+                            ),
+                            const SizedBox(width: 8),
+                            FilledButton.tonalIcon(
+                              icon: const Icon(Icons.note_add), 
+                              label: const Text("追加文件"), 
+                              onPressed: _pickFiles,
+                            ),
+                          ],
                         )
                       ]
                     ),
@@ -2029,11 +2264,14 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                     const SizedBox(height: 16),
                     TextField(
                       controller: _textController, 
-                      maxLines: 15, 
+                      minLines: 15, // 提供优秀的默认视觉高度
+                      maxLines: null, // [核心修改] 允许内部无限制垂直扩展滚动
+                      maxLength: null, //[核心修改] 彻底解除底层字符数量限制
+                      keyboardType: TextInputType.multiline,
                       decoration: InputDecoration(
                         hintText: _enableOCR 
-                          ? "在此粘贴长文本，支持导入纯文本、图片或扫描件PDF。本地视觉模型将自动提取文字并剥离噪声..." 
-                          : "在此粘贴长文本，支持导入纯文本。多模态模型功能已禁用，图片和PDF文件将不会被识别。",
+                          ? "在此粘贴或编辑无限长的文本资料，支持导入纯文本、图片或扫描件PDF。本地系统将自动分块构建向量库..." 
+                          : "在此粘贴无限长文本。多模态模型已禁用。",
                         border: const OutlineInputBorder()
                       )
                     ),
@@ -2056,7 +2294,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       child: FilledButton.icon(
                         icon: Icon(_isEditMode ? Icons.save : Icons.auto_awesome), 
                         label: Text(_isEditMode ? "保存知识库更新" : "双流引擎开始制卷"), 
-                        onPressed: _isProcessingFiles ? null : _submitTask
+                        onPressed: _isProcessingQueue ? null : _submitTask
                       )
                     )
                   ]
