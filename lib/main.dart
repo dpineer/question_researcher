@@ -38,6 +38,243 @@ class AppLogger {
 }
 
 // ==========================================
+// 附加视图层 - 知识库专属 Q&A 问答交互界面
+// ==========================================
+class ChatMessage {
+  final String role; // 'user' or 'ai'
+  final String text;
+  ChatMessage({required this.role, required this.text});
+}
+
+class ChatWithKnowledgeScreen extends StatefulWidget {
+  final SavedExam exam;
+  const ChatWithKnowledgeScreen({super.key, required this.exam});
+
+  @override
+  State<ChatWithKnowledgeScreen> createState() => _ChatWithKnowledgeScreenState();
+}
+
+class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
+  final List<ChatMessage> _messages = [];
+  final TextEditingController _chatController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  
+  bool _isReplying = false;
+  bool _isGeneratingDAG = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _messages.add(ChatMessage(
+      role: 'ai', 
+      text: "您好！我是您的 AI 助教。我已经阅读了题库 **【${widget.exam.title}】** 的所有知识源。有什么关于这部分内容的问题需要和我探讨吗？"
+    ));
+  }
+
+  void _scrollToBottom() {
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  Future<void> _sendMessage() async {
+    final text = _chatController.text.trim();
+    if (text.isEmpty || _isReplying) return;
+
+    setState(() {
+      _messages.add(ChatMessage(role: 'user', text: text));
+      _isReplying = true;
+      _chatController.clear();
+    });
+    _scrollToBottom();
+
+    // 1. 进行 RAG 知识检索获取上下文
+    String relevantContext = widget.exam.knowledgeBase;
+    final embeddingModel = await ConfigService.getEmbeddingModel();
+    final lmUrl = await ConfigService.getLmStudioUrl();
+    
+    if (embeddingModel.isNotEmpty && relevantContext.length > 600) {
+      AppLogger.log("Q&A 触发语义检索...");
+      relevantContext = await SemanticRetrievalService.getRelevantContext(
+        widget.exam.knowledgeBase, text, embeddingModel, lmUrl,
+      );
+    }
+
+    // 2. 调用大模型回答
+    String aiResponse = await DualAIService.answerQuestionWithContext(text, relevantContext);
+
+    if (mounted) {
+      setState(() {
+        _messages.add(ChatMessage(role: 'ai', text: aiResponse));
+        _isReplying = false;
+      });
+      _scrollToBottom();
+    }
+  }
+
+  // --- [迁移集成] DAG 辅助理解生成系统 ---
+  Future<void> _generateDAG() async {
+    final text = widget.exam.knowledgeBase.trim();
+    if (text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("知识库为空")));
+      return;
+    }
+
+    setState(() => _isGeneratingDAG = true);
+    final dagCode = await DualAIService.generateKnowledgeDAG(text);
+    setState(() => _isGeneratingDAG = false);
+    
+    if (mounted) _showDAGDialog(dagCode);
+  }
+
+  void _showDAGDialog(String dagCode) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.account_tree, color: Colors.blue),
+            const SizedBox(width: 8),
+            const Text("知识图谱 DAG (Mermaid)"),
+          ],
+        ),
+        content: SizedBox(
+          width: 600, height: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("已为您抽取出关键信息的逻辑化有向无环图，您可以复制代码并在任意支持 Mermaid 的渲染器中查看：", style: TextStyle(fontSize: 13, color: Colors.grey)),
+              const SizedBox(height: 12),
+              Expanded(
+                child: Container(
+                  width: double.infinity, padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceVariant, borderRadius: BorderRadius.circular(8)),
+                  child: SingleChildScrollView(child: SelectableText(dagCode, style: const TextStyle(fontFamily: 'monospace', fontSize: 12))),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton.icon(
+            icon: const Icon(Icons.copy), label: const Text("复制代码"),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: dagCode));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("DAG 代码已复制到剪贴板")));
+            },
+          ),
+          FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text("关闭"))
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("探讨：${widget.exam.title}"),
+        actions: [
+          // DAG 功能已微缩至此处为快捷小图标
+          _isGeneratingDAG
+            ? const Center(child: Padding(padding: EdgeInsets.symmetric(horizontal: 16), child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))))
+            : IconButton(
+                icon: const Icon(Icons.account_tree, color: Colors.blueAccent),
+                tooltip: "一键抽取逻辑 DAG 图",
+                onPressed: _generateDAG,
+              ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollController,
+              padding: const EdgeInsets.all(16),
+              itemCount: _messages.length,
+              itemBuilder: (context, index) {
+                final msg = _messages[index];
+                final isUser = msg.role == 'user';
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 24),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+                    children: [
+                      if (!isUser) ...[
+                        const CircleAvatar(backgroundColor: Colors.indigo, child: Icon(Icons.smart_toy, color: Colors.white, size: 20)),
+                        const SizedBox(width: 12),
+                      ],
+                      Flexible(
+                        child: Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: isUser ? Theme.of(context).colorScheme.primaryContainer : Theme.of(context).colorScheme.surfaceVariant,
+                            borderRadius: BorderRadius.only(
+                              topLeft: const Radius.circular(16),
+                              topRight: const Radius.circular(16),
+                              bottomLeft: Radius.circular(isUser ? 16 : 0),
+                              bottomRight: Radius.circular(isUser ? 0 : 16),
+                            ),
+                          ),
+                          // 核心：使用 Markdown 引擎渲染回复
+                          child: _renderMarkdown(msg.text, isSelectable: true, shrinkWrap: true),
+                        ),
+                      ),
+                      if (isUser) ...[
+                        const SizedBox(width: 12),
+                        CircleAvatar(backgroundColor: Colors.grey.shade400, child: const Icon(Icons.person, color: Colors.white, size: 20)),
+                      ],
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          if (_isReplying)
+            const Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Text("AI 导师正在查阅资料并思考...", style: TextStyle(color: Colors.grey, fontStyle: FontStyle.italic)),
+            ),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _chatController,
+                    maxLines: 3, minLines: 1,
+                    decoration: const InputDecoration(hintText: "就当前知识库提出疑问...", border: OutlineInputBorder()),
+                    onSubmitted: (_) => _sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                FilledButton(
+                  onPressed: _isReplying ? null : _sendMessage,
+                  style: FilledButton.styleFrom(shape: const CircleBorder(), padding: const EdgeInsets.all(16)),
+                  child: const Icon(Icons.send),
+                )
+              ],
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}
+// ==========================================
 // 附加服务：Markdown与LaTeX动态渲染器
 // ==========================================
 String _preprocessLatex(String text) {
@@ -638,6 +875,52 @@ $contextText
       return "DAG 生成异常: $e";
     }
   }
+
+  /// [新增] 基于本地提取上下文的 Q&A 问答生成 (云端大模型)
+  static Future<String> answerQuestionWithContext(String question, String contextText) async {
+    final apiKey = await ConfigService.getDeepSeekKey();
+    if (apiKey.isEmpty) return "错误: 未配置云端 API Key";
+
+    final prompt = """
+你是一个严谨的学术助教。请基于以下提供的【知识库检索上下文】回答用户的问题。
+要求：
+1. 答案必须准确、精炼，并使用 Markdown 格式排版。
+2. 如果【知识库检索上下文】中没有涵盖相关信息，请明确告知"资料中未提及相关内容"，绝对禁止伪造事实或凭空捏造。
+
+【知识库检索上下文】：
+$contextText
+
+【用户提问】：
+$question
+""";
+
+    AppLogger.log("启动知识库定向问答，请求大模型进行思考...");
+
+    try {
+      final response = await _dio.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        options: Options(
+          headers: {"Authorization": "Bearer $apiKey", "Content-Type": "application/json"},
+          receiveTimeout: const Duration(minutes: 3),
+        ),
+        data: {
+          "model": "deepseek-chat",
+          "messages": [
+            {"role": "system", "content": "你是一个严格遵循所提供资料的问答助手。"},
+            {"role": "user", "content": prompt}
+          ],
+          "temperature": 0.2, // 保持低随机性以确保事实准确
+        },
+      );
+      
+      final usage = response.data['usage'];
+      AppLogger.log("问答响应成功！消耗 Tokens:[Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
+      return response.data['choices'][0]['message']['content'].toString().trim();
+    } catch (e) {
+      AppLogger.log("问答请求异常: $e", isError: true);
+      return "问答请求异常: $e";
+    }
+  }
 }
 
 // ==========================================
@@ -966,8 +1249,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       subtitle: Text("题量: ${item.parsedQuestions.length} | 题型覆盖单选/多选/填空/简答"),
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
-                        children:[
-                          // 新增：编辑原始知识库
+                        children: [
+                          // [修改] 指向统一的 KnowledgeInputScreen
                           IconButton(
                             icon: const Icon(Icons.edit_document, color: Colors.teal),
                             tooltip: "编辑原始知识库",
@@ -978,13 +1261,14 @@ class _HomeScreenState extends State<HomeScreen> {
                                 );
                                 return;
                               }
+                              // 跳转到统一界面进行编辑
                               Navigator.push(
                                 context,
-                                MaterialPageRoute(builder: (_) => KnowledgeEditScreen(exam: item))
-                              ).then((_) => _loadHistory()); // 返回后刷新列表
+                                MaterialPageRoute(builder: (_) => KnowledgeInputScreen(existingExam: item))
+                              ).then((_) => _loadHistory());
                             }
                           ),
-                          // 新增：重新从原知识库生成试卷
+                          // 原有：重新从原知识库生成试卷
                           IconButton(
                             icon: const Icon(Icons.refresh, color: Colors.blue), 
                             tooltip: "从原知识库生成新考题", 
@@ -993,11 +1277,25 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库为旧版本生成，无原始知识库缓存。")));
                                 return;
                               }
-                              // 调用重构流程
                               context.read<ExamProvider>().processAndGenerate(
                                 rawText: item.knowledgeBase, topic: item.title, count: item.parsedQuestions.length, difficulty: "中等"
                               ).then((_) => _loadHistory());
                               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在后台洗牌生成新考题...")));
+                            }
+                          ),
+                          // [新增] 本地知识库 Q&A 对话功能
+                          IconButton(
+                            icon: const Icon(Icons.question_answer, color: Colors.purple),
+                            tooltip: "知识库问答与探讨",
+                            onPressed: () {
+                              if (item.knowledgeBase.isEmpty) {
+                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库无原始知识库，无法进行问答。")));
+                                return;
+                              }
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(builder: (_) => ChatWithKnowledgeScreen(exam: item))
+                              );
                             }
                           ),
                           IconButton(icon: const Icon(Icons.history), tooltip: "查看历史记录", onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamHistoryScreen(exam: item)))),
@@ -1355,7 +1653,9 @@ class _ExamHistoryScreenState extends State<ExamHistoryScreen> {
 }
 
 class KnowledgeInputScreen extends StatefulWidget {
-  const KnowledgeInputScreen({super.key});
+  final SavedExam? existingExam; // [新增] 用于判定是否为编辑模式
+
+  const KnowledgeInputScreen({super.key, this.existingExam});
   @override
   State<KnowledgeInputScreen> createState() => _KnowledgeInputScreenState();
 }
@@ -1365,41 +1665,42 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   final TextEditingController _textController = TextEditingController();
   int _questionCount = 5;
 
-  // --- 状态机：文件处理进度 ---
   bool _isProcessingFiles = false;
   int _totalFilesToProcess = 0;
   int _processedFilesCount = 0;
-
-  // --- OCR 选项配置 ---
   bool _enableOCR = true;
   final String _ocrModel = "vision-model";
   bool _useNativePDF = true;
 
-  // --- 状态机：系统内部日志 ---
-  final List<String> _logLines = ["[INFO] 系统已就绪，等待注入资料..."];
+  final List<String> _logLines = ["[INFO] 系统已就绪，等待交互..."];
   final ScrollController _logScrollController = ScrollController();
   bool _isLogPanelExpanded = false;
   StreamSubscription? _logSubscription;
 
+  bool get _isEditMode => widget.existingExam != null; // 判定标志
+
   @override
   void initState() {
     super.initState();
-    // 挂载全局业务流总线
+    // [新增] 如果为编辑模式，初始化填充数据
+    if (_isEditMode) {
+      _topicController.text = widget.existingExam!.title;
+      _textController.text = widget.existingExam!.knowledgeBase;
+      _questionCount = widget.existingExam!.parsedQuestions.length; // 同步当前题量
+    }
+
     _logSubscription = AppLogger.stream.listen((log) {
       if (!mounted) return;
       setState(() {
         _logLines.add(log);
-        if (_logLines.length > 300) _logLines.removeAt(0); // 维持日志池水位
+        if (_logLines.length > 300) _logLines.removeAt(0);
       });
       if (_isLogPanelExpanded) _scrollToBottom();
     });
     
-    // 初次录入时默认展开日志面板，方便用户查看处理过程
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        setState(() {
-          _isLogPanelExpanded = true;
-        });
+        setState(() => _isLogPanelExpanded = true);
         _scrollToBottom();
       }
     });
@@ -1527,13 +1828,65 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     }
   }
 
+  // [修改] 提交核心调度枢纽
   void _submitTask() async {
     if (_topicController.text.trim().isEmpty || _textController.text.trim().isEmpty) return;
-    final provider = context.read<ExamProvider>();
-    final success = await provider.processAndGenerate(
-      topic: _topicController.text.trim(), rawText: _textController.text.trim(), count: _questionCount, difficulty: "中等"
-    );
-    if (success && mounted) Navigator.pop(context);
+    
+    if (_isEditMode) {
+      // ==== 编辑模式：执行原 KnowledgeEditScreen 的保存与 Rerank 逻辑 ====
+      setState(() => _isProcessingFiles = true);
+      String finalText = _textController.text.trim();
+      
+      final enableRerank = await ConfigService.getEnableRerank();
+      if (enableRerank) {
+        final rerankModel = await ConfigService.getRerankModel();
+        if (rerankModel.isNotEmpty) {
+          AppLogger.log("启动 Rerank 优化模型处理知识库文本...");
+          try {
+            final localUrl = await ConfigService.getLmStudioUrl();
+            final response = await Dio().post(
+              '$localUrl/chat/completions',
+              options: Options(receiveTimeout: const Duration(minutes: 5)),
+              data: {
+                "model": rerankModel, 
+                "messages":[
+                  {"role": "system", "content": "你是一个文本重排序专家。请对输入的文本进行重新排序，将最重要的内容放在前面，按重要性递减的顺序排列。"},
+                  {"role": "user", "content": "请对以下文本进行重排序：\n\n文本：$finalText"}
+                ],
+                "temperature": 0.1,
+              },
+            );
+            final usage = response.data['usage'];
+            AppLogger.log("Rerank 处理完毕，消耗 Tokens: [Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
+            finalText = response.data['choices'][0]['message']['content'];
+          } catch (e) {
+            AppLogger.log("Rerank 模型返回异常，使用原始文本保存", isError: true);
+          }
+        }
+      }
+      
+      final updatedExam = SavedExam(
+        id: widget.existingExam!.id,
+        title: _topicController.text.trim(),
+        examJson: widget.existingExam!.examJson,
+        knowledgeBase: finalText,
+        createdAt: widget.existingExam!.createdAt,
+      );
+      await DatabaseHelper.updateExam(updatedExam);
+      
+      if (mounted) {
+        setState(() => _isProcessingFiles = false);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 知识库数据已成功更新")));
+        Navigator.pop(context);
+      }
+    } else {
+      // ==== 新建模式：执行出题引擎流程 ====
+      final provider = context.read<ExamProvider>();
+      final success = await provider.processAndGenerate(
+        topic: _topicController.text.trim(), rawText: _textController.text.trim(), count: _questionCount, difficulty: "中等"
+      );
+      if (success && mounted) Navigator.pop(context);
+    }
   }
 
   // ==========================================
@@ -1685,16 +2038,26 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       )
                     ),
                     const SizedBox(height: 24),
-                    DropdownButtonFormField<int>(
-                      value: _questionCount, 
-                      decoration: const InputDecoration(labelText: "题量", border: OutlineInputBorder()),
-                      items:[3, 5, 10, 15].map((e) => DropdownMenuItem(value: e, child: Text("$e 题"))).toList(),
-                      onChanged: (v) => setState(() => _questionCount = v!),
-                    ),
-                    const SizedBox(height: 32),
+                    
+                    // [修改] 新建模式才显示题量下拉框，编辑模式隐藏
+                    if (!_isEditMode) ...[
+                      DropdownButtonFormField<int>(
+                        value: _questionCount, 
+                        decoration: const InputDecoration(labelText: "目标出题量", border: OutlineInputBorder()),
+                        items:[3, 5, 10, 15].map((e) => DropdownMenuItem(value: e, child: Text("$e 题"))).toList(),
+                        onChanged: (v) => setState(() => _questionCount = v!),
+                      ),
+                      const SizedBox(height: 32),
+                    ],
+
                     SizedBox(
                       width: double.infinity, height: 50, 
-                      child: FilledButton.icon(icon: const Icon(Icons.auto_awesome), label: const Text("双流引擎开始生成"), onPressed: _isProcessingFiles ? null : _submitTask)
+                      // [修改] 动态变更按钮文案与图标
+                      child: FilledButton.icon(
+                        icon: Icon(_isEditMode ? Icons.save : Icons.auto_awesome), 
+                        label: Text(_isEditMode ? "保存知识库更新" : "双流引擎开始制卷"), 
+                        onPressed: _isProcessingFiles ? null : _submitTask
+                      )
                     )
                   ]
                 ),
