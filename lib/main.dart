@@ -478,64 +478,118 @@ class ThemeProvider extends ChangeNotifier {
 class ConfigService {
   static const _storage = FlutterSecureStorage();
   
+  // 初始化时迁移现有配置
+  static Future<void> _migrateIfNeeded() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final db = await DatabaseHelper.database;
+      
+      // 检查是否已经迁移过
+      final migrated = await DatabaseHelper.getConfig("config_migrated");
+      if (migrated == "true") return;
+      
+      AppLogger.log("开始迁移配置从 SharedPreferences 到数据库...");
+      
+      // 迁移 LM Studio URL
+      final lmUrl = prefs.getString("lm_studio_url");
+      if (lmUrl != null && lmUrl.isNotEmpty) {
+        await DatabaseHelper.saveConfig("lm_studio_url", lmUrl);
+      }
+      
+      // 迁移模型配置
+      final chatModel = prefs.getString("lm_chat_model");
+      if (chatModel != null && chatModel.isNotEmpty) {
+        await DatabaseHelper.saveConfig("lm_chat_model", chatModel);
+      }
+      
+      final visionModel = prefs.getString("lm_vision_model");
+      if (visionModel != null && visionModel.isNotEmpty) {
+        await DatabaseHelper.saveConfig("lm_vision_model", visionModel);
+      }
+      
+      final rerankModel = prefs.getString("lm_rerank_model");
+      if (rerankModel != null && rerankModel.isNotEmpty) {
+        await DatabaseHelper.saveConfig("lm_rerank_model", rerankModel);
+      }
+      
+      final embeddingModel = prefs.getString("lm_embedding_model");
+      if (embeddingModel != null && embeddingModel.isNotEmpty) {
+        await DatabaseHelper.saveConfig("lm_embedding_model", embeddingModel);
+      }
+      
+      // 迁移 enable_rerank
+      final enableRerank = prefs.getBool("enable_rerank");
+      if (enableRerank != null) {
+        await DatabaseHelper.saveConfig("enable_rerank", enableRerank.toString());
+      }
+      
+      // 标记为已迁移
+      await DatabaseHelper.saveConfig("config_migrated", "true");
+      AppLogger.log("配置迁移完成");
+    } catch (e) {
+      AppLogger.log("配置迁移失败: $e", isError: true);
+    }
+  }
+  
   static Future<String> getDeepSeekKey() async => await _storage.read(key: "deepseek_key") ?? "";
   static Future<void> saveDeepSeekKey(String key) async => await _storage.write(key: "deepseek_key", value: key);
 
   static Future<String> getLmStudioUrl() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString("lm_studio_url") ?? "http://localhost:1234/v1";
+    await _migrateIfNeeded();
+    final value = await DatabaseHelper.getConfig("lm_studio_url");
+    return value ?? "http://localhost:1234/v1";
   }
   static Future<void> saveLmStudioUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString("lm_studio_url", url);
+    await DatabaseHelper.saveConfig("lm_studio_url", url);
   }
 
-  // ==== 新增：动态模型标识配置 ====
+  // ==== 动态模型标识配置 ====
   static Future<String> getChatModel() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString("lm_chat_model") ?? "local-model";
+    await _migrateIfNeeded();
+    final value = await DatabaseHelper.getConfig("lm_chat_model");
+    return value ?? "local-model";
   }
   static Future<void> saveChatModel(String model) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString("lm_chat_model", model);
+    await DatabaseHelper.saveConfig("lm_chat_model", model);
   }
 
   static Future<String> getVisionModel() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString("lm_vision_model") ?? "vision-model";
+    await _migrateIfNeeded();
+    final value = await DatabaseHelper.getConfig("lm_vision_model");
+    return value ?? "vision-model";
   }
   static Future<void> saveVisionModel(String model) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString("lm_vision_model", model);
+    await DatabaseHelper.saveConfig("lm_vision_model", model);
   }
 
   static Future<String> getRerankModel() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString("lm_rerank_model") ?? "";
+    await _migrateIfNeeded();
+    final value = await DatabaseHelper.getConfig("lm_rerank_model");
+    return value ?? "";
   }
   static Future<void> saveRerankModel(String model) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString("lm_rerank_model", model);
+    await DatabaseHelper.saveConfig("lm_rerank_model", model);
   }
 
   static Future<String> getEmbeddingModel() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString("lm_embedding_model") ?? "";
+    await _migrateIfNeeded();
+    final value = await DatabaseHelper.getConfig("lm_embedding_model");
+    return value ?? "";
   }
   static Future<void> saveEmbeddingModel(String model) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString("lm_embedding_model", model);
+    await DatabaseHelper.saveConfig("lm_embedding_model", model);
   }
 
-  // 新增：获取是否启用rerank功能
+  // 获取是否启用rerank功能
   static Future<bool> getEnableRerank() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool("enable_rerank") ?? false;
+    await _migrateIfNeeded();
+    final value = await DatabaseHelper.getConfig("enable_rerank");
+    if (value == null) return false;
+    return value.toLowerCase() == "true";
   }
   
   static Future<void> setEnableRerank(bool enable) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool("enable_rerank", enable);
+    await DatabaseHelper.saveConfig("enable_rerank", enable.toString());
   }
 }
 
@@ -644,8 +698,8 @@ class ExamRecord {
       if (!await docDir.exists()) await docDir.create(recursive: true);
       String dbPath = path.join(docDir.path, 'exams_v2.db'); 
       
-      // [修改] 版本升级至 3，引入 exam_embeddings 表用于持久化本地向量缓存
-      return await openDatabase(dbPath, version: 3, onCreate: (db, version) async {
+      // [修改] 版本升级至 4，引入 app_config 表用于持久化模型配置
+      return await openDatabase(dbPath, version: 4, onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE saved_exams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -676,6 +730,15 @@ class ExamRecord {
             FOREIGN KEY (examId) REFERENCES saved_exams (id) ON DELETE CASCADE
           )
         ''');
+        // [新增] 应用配置表，用于存储模型配置等参数
+        await db.execute('''
+          CREATE TABLE app_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_key TEXT UNIQUE NOT NULL,
+            config_value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        ''');
       }, onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
           await db.execute('ALTER TABLE saved_exams ADD COLUMN knowledgeBase TEXT DEFAULT ""');
@@ -688,6 +751,16 @@ class ExamRecord {
               chunkText TEXT NOT NULL,
               vectorJson TEXT NOT NULL,
               FOREIGN KEY (examId) REFERENCES saved_exams (id) ON DELETE CASCADE
+            )
+          ''');
+        }
+        if (oldVersion < 4) {
+          await db.execute('''
+            CREATE TABLE app_config (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              config_key TEXT UNIQUE NOT NULL,
+              config_value TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
             )
           ''');
         }
@@ -748,6 +821,50 @@ class ExamRecord {
     static Future<List<Map<String, dynamic>>> getEmbeddingsForExam(int examId) async {
       final db = await database;
       return await db.query('exam_embeddings', where: 'examId = ?', whereArgs: [examId]);
+    }
+
+    // [新增] 应用配置管理方法
+    static Future<void> saveConfig(String key, String value) async {
+      final db = await database;
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      await db.insert(
+        'app_config',
+        {
+          'config_key': key,
+          'config_value': value,
+          'updated_at': timestamp,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+
+    static Future<String?> getConfig(String key) async {
+      final db = await database;
+      final result = await db.query(
+        'app_config',
+        where: 'config_key = ?',
+        whereArgs: [key],
+        limit: 1,
+      );
+      if (result.isNotEmpty) {
+        return result.first['config_value'] as String?;
+      }
+      return null;
+    }
+
+    static Future<Map<String, String>> getAllConfigs() async {
+      final db = await database;
+      final results = await db.query('app_config');
+      final configs = <String, String>{};
+      for (var row in results) {
+        configs[row['config_key'] as String] = row['config_value'] as String;
+      }
+      return configs;
+    }
+
+    static Future<void> deleteConfig(String key) async {
+      final db = await database;
+      await db.delete('app_config', where: 'config_key = ?', whereArgs: [key]);
     }
   }
 
@@ -885,7 +1002,7 @@ class DualAIService {
           options: Options(receiveTimeout: const Duration(minutes: 5), validateStatus: (s) => s != null && s < 600),
           data: {
             "model": visionModel, 
-            "messages":[{"role": "user", "content":[{"type": "text", "text": "提取图片中的所有文本信息。"},{"type": "image_url", "image_url": {"url": "data:$mimeType;base64,$base64Img"}}]}]
+            "messages":[{"role": "user", "content":[{"type": "text", "text": "提取图片中的所有文本信息,但是也请描述图片内容,特别是示意图,请直接输出信息。"},{"type": "image_url", "image_url": {"url": "data:$mimeType;base64,$base64Img"}}]}]
           },
         );
         if (response.statusCode != 200) throw Exception("HTTP ${response.statusCode}: ${response.data}");
@@ -1829,7 +1946,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
 
   // --- 升级的状态机：异步任务队列与游标 ---
   bool _isProcessingQueue = false;
-  final List<io.File> _fileQueue = [];
+  final List<String> _pendingPaths = []; // 文件路径队列
+  String? _activeFile; // 当前正在处理的文件
+  int _activePage = 0; // 当前处理到的页码（用于PDF分页）
   int _totalFilesToProcess = 0;
   int _processedFilesCount = 0;
 
@@ -1936,56 +2055,94 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   }
 
   // ==========================================
-  // [新增] 特性 2 & 3: 异步队列调度引擎与文件夹遍历
+  // [修改] 具备系统休眠冻结保护的异步流水线
   // ==========================================
   Future<void> _processFileQueue() async {
-    if (_isProcessingQueue) return; // 互斥锁，确保队列消费者单例运行
+    if (_isProcessingQueue) return;
     setState(() => _isProcessingQueue = true);
 
-    while (_fileQueue.isNotEmpty) {
-      // 消费队列顶端任务
-      final file = _fileQueue.removeAt(0);
-      String filePath = file.path;
-      String ext = path.extension(filePath).toLowerCase();
-      String content = "";
+    while (_pendingPaths.isNotEmpty || _activeFile != null) {
+      if (_activeFile == null) {
+        _activeFile = _pendingPaths.removeAt(0);
+        _activePage = 0;
+        // 切换新文件时存档（这里简化处理，实际项目中可能需要调用 _syncStateToDB）
+      }
 
-      AppLogger.log("⚙️ 正在解析 (${_processedFilesCount + 1}/$_totalFilesToProcess): ${path.basename(filePath)}");
+      String filePath = _activeFile!;
+      String ext = path.extension(filePath).toLowerCase();
+
+      AppLogger.log("⚙️ 正在解析 (${_processedFilesCount + 1}/$_totalFilesToProcess): ${path.basename(filePath)} [断点: 第 $_activePage 页]");
 
       try {
-        if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
-          content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[图片文件，多模态模型已禁用]";
-        } else if (ext == '.pdf') {
-          if (_enableOCR) {
-            content = (_useNativePDF && io.Platform.isLinux) 
-              ? await _parsePdfWithOCR(filePath) // 内部有 fallback
-              : await DualAIService.performLocalOCR(filePath);
-          } else {
-            content = "[PDF 文件，多模态模型已禁用]";
-          }
-        } else if (ext == '.doc' || ext == '.docx') {
-          content = await _parseWordDocument(filePath, ext);
+        if (ext == '.pdf') {
+           if (_enableOCR && _useNativePDF && io.Platform.isLinux) {
+              await _parsePdfWithOCR(filePath, _activePage, (page, total, text) async {
+                 if (mounted) {
+                    setState(() {
+                       final prefix = _textController.text.isEmpty ? "" : "\n";
+                       _textController.text += "$prefix$text";
+                       _activePage = page + 1; // 💥 标记该页彻底成功
+                    });
+                 }
+                 // 每一页成功提取后，可以在这里存档（简化处理）
+              });
+           } else {
+              if (_activePage == 0) {
+                  String content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[PDF 模型禁用]";
+                  if (mounted) setState(() => _textController.text += "\n$content");
+                  _activePage = 1; 
+              }
+           }
         } else {
-          // 纯文本/JSON/Markdown/代码 等文件走智能编码探测
-          content = await _readTextFileSmart(filePath);
+           if (_activePage == 0) {
+               String content = "";
+               if (['.png', '.jpg', '.jpeg'].contains(ext)) {
+                  content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[图片模型禁用]";
+               } else if (ext == '.doc' || ext == '.docx') {
+                  content = await _parseWordDocument(filePath, ext);
+               } else {
+                  content = await _readTextFileSmart(filePath);
+               }
+               
+               if (mounted) {
+                  setState(() {
+                     final prefix = _textController.text.isEmpty ? "" : "\n\n";
+                     _textController.text += "$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content";
+                  });
+               }
+               _activePage = 1;
+           }
         }
+
+        // --- 若能运行到这里，说明整个文件顺利结束，开始推进下一个文件 ---
+        _activeFile = null;
+        _activePage = 0;
+        _processedFilesCount++;
+        // 存档（简化处理）
+
       } catch (e) {
-        content = "\n[文件 ${path.basename(filePath)} 未知异常: $e]";
+        String errStr = e.toString().toLowerCase();
+        
+        // [核心修复] 如果判定为大模型后端超时、系统休眠或连接重置，触发【挂起保护】！
+        if (errStr.contains("timeout") || errStr.contains("重试耗尽") || errStr.contains("socket") || errStr.contains("connection")) {
+            AppLogger.log("⏸️ 检测到系统休眠或网络中断！保护机制已触发，进度安全冻结于: 第 $_activePage 页。", isError: true);
+            if (mounted) {
+                setState(() => _isProcessingQueue = false); // 终止循环任务
+            }
+            return; // 直接退出 while 循环，不清理 `_activeFile`
+        } else {
+            // 如果是真正的解析失败（文件损坏、不存在等），抛弃文件继续前进
+            AppLogger.log("❌ 解析发生致命异常，放弃当前文件: $e", isError: true);
+            if (mounted) setState(() => _textController.text += "\n[文件 ${path.basename(filePath)} 致命异常: $e]");
+            _activeFile = null;
+            _activePage = 0;
+            _processedFilesCount++;
+        }
       }
 
-      // 将提取的内容注入文本框
-      if (mounted) {
-        setState(() {
-          final prefix = _textController.text.isEmpty ? "" : "\n\n";
-          _textController.text += "$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content";
-          _processedFilesCount++;
-        });
-      }
-      
-      // 让出事件循环，避免卡死 UI 并允许用户输入新的文件
-      await Future.delayed(const Duration(milliseconds: 100)); 
+      await Future.delayed(const Duration(milliseconds: 100)); // 让出事件循环
     }
 
-    // 队列清空，关闭流水线
     if (mounted) {
       setState(() => _isProcessingQueue = false);
       AppLogger.log("✅ 队列中所有文件已全部映射到知识库完成。");
@@ -1995,11 +2152,11 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   void _addFilesToQueue(List<io.File> files) {
     if (files.isEmpty) return;
     setState(() {
-      _fileQueue.addAll(files);
+      _pendingPaths.addAll(files.map((f) => f.path));
       _totalFilesToProcess += files.length;
       if (!_isLogPanelExpanded) _isLogPanelExpanded = true;
     });
-    AppLogger.log("📥 队列新增 ${files.length} 个任务，当前队列积压 ${_fileQueue.length} 个任务");
+    AppLogger.log("📥 队列新增 ${files.length} 个任务，当前队列积压 ${_pendingPaths.length} 个任务");
     _scrollToBottom();
     _processFileQueue(); // 尝试启动或激活消费者
   }
@@ -2038,32 +2195,33 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     }
   }
 
-  Future<String> _parsePdfWithOCR(String filePath) async {
+  // [修复] 具备内存安全与断点续传能力的 PDF 解析
+  Future<void> _parsePdfWithOCR(String filePath, int startPage, Function(int page, int total, String text) onPage) async {
+    final check = await io.Process.run('which', ['pdftoppm']);
+    if (check.exitCode != 0) throw Exception("缺少 Linux 原生 PDF 依赖。");
+
+    io.Directory? tempDir;
     try {
-      if (io.Platform.isLinux) {
-        final check = await io.Process.run('which',['pdftoppm']);
-        if (check.exitCode != 0) throw Exception("缺少 Linux 原生 PDF 依赖。终端执行: sudo apt-get install poppler-utils");
+      tempDir = await io.Directory.systemTemp.createTemp('ai_teacher_pdf_');
+      await io.Process.run('pdftoppm',['-png', '-r', '150', filePath, '${tempDir.path}/page']);
 
-        final tempDir = await io.Directory.systemTemp.createTemp('ai_teacher_pdf_');
-        await io.Process.run('pdftoppm',['-png', '-r', '150', filePath, '${tempDir.path}/page']);
+      final files = tempDir.listSync().whereType<io.File>().where((f) => f.path.endsWith('.png')).toList();
+      files.sort((a, b) => a.path.compareTo(b.path));
 
-        String accumulatedContent = "";
-        final files = tempDir.listSync().whereType<io.File>().where((f) => f.path.endsWith('.png')).toList();
-        files.sort((a, b) => a.path.compareTo(b.path));
-
-        for (int i = 0; i < files.length; i++) {
-          final pageText = await DualAIService.performLocalOCR(files[i].path);
-          accumulatedContent += "\n[第${i+1}页提取]:\n$pageText\n";
-          if (i < files.length - 1) await Future.delayed(const Duration(seconds: 2));
-        }
-
-        await tempDir.delete(recursive: true); 
-        return accumulatedContent;
-      } else {
-        throw Exception("该系统需要原生 PDF 引擎。");
+      // 完美从上次死掉/休眠的 startPage 恢复，跳过已处理的页面
+      for (int i = startPage; i < files.length; i++) {
+        if (!mounted) break; 
+        
+        final pageText = await DualAIService.performLocalOCR(files[i].path);
+        onPage(i, files.length, "\n[第${i+1}页提取]:\n$pageText\n");
+        
+        if (i < files.length - 1) await Future.delayed(const Duration(seconds: 1));
       }
-    } catch (e) {
-      return "[PDF 视觉提取失败]: $e";
+    } finally {
+      // 核心修复：即使中途因为休眠爆出重试异常，也会确保系统缓存被清理
+      if (tempDir != null && await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
     }
   }
 
@@ -2115,6 +2273,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   // ==========================================
   Widget _buildLogPanel() {
     double progress = _totalFilesToProcess > 0 ? (_processedFilesCount / _totalFilesToProcess) : 0.0;
+    bool hasPendingTasks = _pendingPaths.isNotEmpty || _activeFile != null; // 判定是否有挂起任务
 
     return Container(
       decoration: BoxDecoration(
@@ -2135,8 +2294,10 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                 children:[
                   Icon(_isLogPanelExpanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up),
                   const SizedBox(width: 8),
-                  const Text("模型状态与数据库日志", style: TextStyle(fontWeight: FontWeight.bold)),
+                  const Text("日志控制台与队列状态", style: TextStyle(fontWeight: FontWeight.bold)),
                   const Spacer(),
+                  
+                  // [修改] 增加判定挂起状态的 UI
                   if (_isProcessingQueue) ...[
                     SizedBox(width: 100, child: LinearProgressIndicator(value: progress)),
                     const SizedBox(width: 12),
@@ -2144,6 +2305,17 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       "流水线运行中: $_processedFilesCount/$_totalFilesToProcess", 
                       style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary)
                     ),
+                  ] else if (hasPendingTasks) ...[
+                    // 这里会展示因为休眠而被挂起的进度
+                    const Icon(Icons.pause_circle_filled, size: 16, color: Colors.orange),
+                    const SizedBox(width: 6),
+                    Text("进度已挂起 (断点: 第 $_activePage 页)", style: const TextStyle(fontSize: 12, color: Colors.orange)),
+                    const SizedBox(width: 8),
+                    FilledButton.tonal(
+                      style: FilledButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 12)),
+                      onPressed: _processFileQueue, // 用户点击后从断点继续
+                      child: const Text("▶️ 继续解析", style: TextStyle(fontSize: 12)),
+                    )
                   ] else ...[
                     const Icon(Icons.circle, size: 10, color: Colors.green),
                     const SizedBox(width: 6),
