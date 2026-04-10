@@ -49,7 +49,8 @@ class ChatMessage {
 
 class ChatWithKnowledgeScreen extends StatefulWidget {
   final SavedExam exam;
-  const ChatWithKnowledgeScreen({super.key, required this.exam});
+  final String? initialMessage; //[新增] 用于接受上个界面的追问
+  const ChatWithKnowledgeScreen({super.key, required this.exam, this.initialMessage});
 
   @override
   State<ChatWithKnowledgeScreen> createState() => _ChatWithKnowledgeScreenState();
@@ -60,17 +61,30 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
   final TextEditingController _chatController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   
+  late SavedExam _currentExam; // [新增] 维护当前库的最新状态
   bool _isReplying = false;
   bool _isGeneratingDAG = false;
   bool _isProcessingImage = false; // 控制图片解析状态
+  bool _isGeneratingQuestion = false; // [新增] 出题状态
+  
+  // --- [文件1 新增] --- 
+  // [修复-问题1] 增加状态变量：等待用户在对话框中作答的题目
+  ExamQuestion? _pendingQuestionToAnswer;
 
   @override
   void initState() {
     super.initState();
+    _currentExam = widget.exam;
     _messages.add(ChatMessage(
       role: 'ai', 
-      text: "您好！我已经向量化学习了 **【${widget.exam.title}】**。您可以输入文字提问，或者点击左下角上传图片/文档，我会自动提取其中内容作为讨论上下文！"
+      text: "您好！我已经向量化学习了 **【${_currentExam.title}】**。您可以向我提问，或者在输入要求后点击右下角的【出题】按钮，我将为您单独生成一道题目并收录进题库！"
     ));
+
+    // [新增] 如果带有初始追问信息，自动填充并发送
+    if (widget.initialMessage != null) {
+      _chatController.text = widget.initialMessage!;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _sendMessage());
+    }
   }
 
   void _scrollToBottom() {
@@ -128,6 +142,36 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
     });
     _scrollToBottom();
 
+    // --- [文件1 修改点 1: 优先处理待作答题目] ---
+    // [修复-问题1] 优先处理等待作答的测验题目逻辑，完成作答与智能评判
+    if (_pendingQuestionToAnswer != null) {
+      try {
+        String feedback = await DualAIService.evaluateUserAnswerLocally(_pendingQuestionToAnswer!, text);
+        if (mounted) {
+          setState(() {
+            _messages.add(ChatMessage(
+              role: 'ai',
+              text: "**💡 AI 导师批改结果：**\n\n$feedback\n\n**标准答案：**\n${_pendingQuestionToAnswer!.correctAnswer}\n\n**解析：**\n${_pendingQuestionToAnswer!.analysis}"
+            ));
+            _isReplying = false;
+            _pendingQuestionToAnswer = null; // 清除状态
+          });
+          _scrollToBottom();
+        }
+      } catch (e) {
+        AppLogger.log("批改异常: $e", isError: true);
+        if (mounted) {
+          setState(() {
+            _messages.add(ChatMessage(role: 'ai', text: "批改过程出现异常: $e"));
+            _isReplying = false;
+            _pendingQuestionToAnswer = null;
+          });
+          _scrollToBottom();
+        }
+      }
+      return; // 批改结束后直接返回，不进入普通问答
+    }
+
     final embeddingModel = await ConfigService.getEmbeddingModel();
     final lmUrl = await ConfigService.getLmStudioUrl();
     
@@ -138,11 +182,11 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
       // 1. 强制依赖 Embedding 模型保障底层防溢出
       if (embeddingModel.isEmpty) {
         relevantContext = "[系统异常提示：未配置 Embedding 模型。为了避免触发 400 上下文溢出崩溃，系统已阻断此次全量文本请求。请前往设置页绑定大模型。]";
-      } else if (widget.exam.id != null) {
+      } else if (_currentExam.id != null) {
         AppLogger.log("Q&A 触发本地 SQLite 向量库检索机制...");
         // 2. 从无限的 SQLite 库中提取 Top-5 的 Chunk 块
         retrievedChunks = await SemanticRetrievalService.searchContext(
-          widget.exam.id!, text, embeddingModel, lmUrl,
+          _currentExam.id!, text, embeddingModel, lmUrl,
         );
         
         if (retrievedChunks.isNotEmpty) {
@@ -174,6 +218,52 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
         _scrollToBottom();
       }
     }
+  }
+
+  // [新增] 利用对话框上下文动态生成题目并追加至数据库
+  Future<void> _generateQuestionFromChat() async {
+    final text = _chatController.text.trim();
+    final intent = text.isEmpty ? "请随机抽取当前资料中的一个核心知识点，生成一道题目" : text;
+    
+    setState(() => _isGeneratingQuestion = true);
+    _chatController.clear();
+
+    final embeddingModel = await ConfigService.getEmbeddingModel();
+    final lmUrl = await ConfigService.getLmStudioUrl();
+    String relevantContext = "";
+    
+    // RAG 提取强相关资料
+    if (embeddingModel.isNotEmpty && _currentExam.id != null) {
+      final chunks = await SemanticRetrievalService.searchContext(_currentExam.id!, intent, embeddingModel, lmUrl);
+      if (chunks.isNotEmpty) relevantContext = chunks.join("\n\n");
+    }
+
+    final newQuestion = await DualAIService.generateSingleQuestionFromChat(relevantContext, intent);
+
+    if (newQuestion != null) {
+      // 追加到当前题库并更新 SQLite
+      final questions = _currentExam.parsedQuestions;
+      questions.add(newQuestion);
+      
+      _currentExam = SavedExam(
+        id: _currentExam.id, title: _currentExam.title,
+        examJson: jsonEncode(questions.map((q) => q.toJson()).toList()),
+        knowledgeBase: _currentExam.knowledgeBase,
+        createdAt: _currentExam.createdAt
+      );
+      await DatabaseHelper.updateExam(_currentExam);
+
+      if (mounted) {
+        setState(() {
+          _messages.add(ChatMessage(role: 'ai', text: "✅ **已为您成功生成并收录了一道新考题：**\n\n**题型**：${newQuestion.type}\n**题目**：${newQuestion.question}\n**选项**：\n${newQuestion.options.map((e)=>'- $e').join('\n')}\n\n*（您可以在工作台直接启动测验以作答此题）*"));
+        });
+      }
+    } else {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("题目生成失败，请稍后重试")));
+    }
+    
+    setState(() => _isGeneratingQuestion = false);
+    _scrollToBottom();
   }
 
   // --- DAG生成等逻辑保持之前的不变 ---
@@ -340,31 +430,33 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
             ),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                // [新增] 多模态文件入口
+              children:[
                 IconButton(
-                  icon: _isProcessingImage 
-                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.attach_file, color: Colors.blueGrey),
+                  icon: _isProcessingImage ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.attach_file, color: Colors.blueGrey),
                   tooltip: "提取图片或文档内容",
-                  onPressed: _isProcessingImage || _isReplying ? null : _handleFileAttachment,
+                  onPressed: _isProcessingImage || _isReplying || _isGeneratingQuestion ? null : _handleFileAttachment,
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: TextField(
-                    controller: _chatController,
-                    maxLines: 6, minLines: 1,
-                    decoration: const InputDecoration(
-                      hintText: "就当前知识库提出疑问，或输入附件解析后提问...", 
-                      border: OutlineInputBorder()
-                    ),
+                    controller: _chatController, maxLines: 6, minLines: 1,
+                    decoration: const InputDecoration(hintText: "提出疑问，或者输入出题指令后点击右侧的出题按钮...", border: OutlineInputBorder()),
                   ),
                 ),
                 const SizedBox(width: 12),
+                //[新增] 动态生成题目的快捷操作按钮
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4.0),
+                  child: IconButton(
+                    icon: _isGeneratingQuestion ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.add_task, color: Colors.indigo),
+                    tooltip: "按左侧要求生成一道题目",
+                    onPressed: _isReplying || _isGeneratingQuestion ? null : _generateQuestionFromChat,
+                  ),
+                ),
                 Padding(
                   padding: const EdgeInsets.only(bottom: 4.0),
                   child: FilledButton(
-                    onPressed: _isReplying ? null : _sendMessage,
+                    onPressed: _isReplying || _isGeneratingQuestion ? null : _sendMessage,
                     style: FilledButton.styleFrom(shape: const CircleBorder(), padding: const EdgeInsets.all(16)),
                     child: const Icon(Icons.send),
                   ),
@@ -937,8 +1029,9 @@ class DualAIService {
     }
   }
 
+  // [修改] 增加 customPrompt 入参
   static Future<Map<String, dynamic>> generateMixedExam({
-    required String contextText, required String topic, required int count, required String difficulty,
+    required String contextText, required String topic, required int count, required String difficulty, String customPrompt = "",
   }) async {
     final apiKey = await ConfigService.getDeepSeekKey();
     if (apiKey.isEmpty) {
@@ -949,13 +1042,12 @@ class DualAIService {
     String draftedIdeas = await _draftIdeasLocally(contextText, count);
 
     AppLogger.log("向云端大模型 (DeepSeek) 请求最终 JSON 混合题型构建...");
-    // 省略 Prompt 构造部分（保持原有逻辑）
-    final prompt = """你是一个资深的学科出题专家。请基于以下提供的【本地助教出题灵感】和【原始上下文资料】，针对主题【$topic】，生成一份高质量的混合题型试卷。
+    final prompt = """你是一个资深的学科出题专家。请基于以下提供的【知识库检索上下文】，针对主题【$topic】，生成一份高质量的混合题型试卷。
 出题严格要求：
 1. 题量：$count 道。难度：$difficulty。
-2. 题型分布：必须包含单选(single_choice)、多选(multi_choice)、填空(fill_blank)、应用题(essay)。
-3. 重点考察：不要直接考文档中的具体代码实现，而是考察对概念、思路、框架、架构设计的理解和应用。
-【出题灵感】：\n$draftedIdeas\n【原始上下文】：\n$contextText
+2. 题型分布：必须包含单选、多选、填空、应用题。
+3. 【用户自定义出题指令】：${customPrompt.isNotEmpty ? customPrompt : '无特殊指令，请全面考察核心概念'}
+【原始上下文】：\n$contextText
 必须以严格 JSON 格式返回：{"questions":[{"type": "single_choice", "question": "题干", "options":["A", "B", "C", "D"], "correct_answer": "正确答案", "analysis": "详细解析"}]}""";
 
     try {
@@ -968,7 +1060,7 @@ class DualAIService {
         data: {
           "model": "deepseek-chat",
           "messages":[
-            {"role": "system", "content": "你是一个严格的 JSON 出题机器。禁止输出任何非 JSON 格式的内容。"},
+            {"role": "system", "content": "你是一个严格的 JSON 出题机器。"},
             {"role": "user", "content": prompt}
           ],
           "temperature": 0.3,
@@ -1049,6 +1141,43 @@ class DualAIService {
       return response.data['choices'][0]['message']['content'].toString().trim();
     } catch (e) {
       return "诊断生成失败，请参考标准答案进行自纠。";
+    }
+  }
+
+  // [新增] 优先使用本地 AI 进行阅卷批改，节省云端算力
+  static Future<String> evaluateUserAnswerLocally(ExamQuestion q, dynamic userAnswer) async {
+    final localUrl = await ConfigService.getLmStudioUrl();
+    final chatModel = await ConfigService.getChatModel();
+    
+    // 如果没有配置本地模型，自动降级去请求云端
+    if (chatModel.isEmpty) return await evaluateUserAnswer(q, userAnswer);
+
+    AppLogger.log("启动本地 AI [$chatModel] 代劳进行阅卷批改...");
+    final prompt = """
+你是一个严谨的AI阅卷老师。请对学生的回答进行批改诊断。
+题目：${q.question}
+标准答案/采分点：${jsonEncode(q.correctAnswer)}
+题目解析：${q.analysis}
+
+考生回答：${jsonEncode(userAnswer)}
+
+请判断考生的回答是否正确，并用50-100字简短指出其思维误区或闪光点。不要输出多余格式，直接回复文本评语。
+""";
+
+    try {
+      final response = await _dio.post(
+        '$localUrl/chat/completions',
+        options: Options(receiveTimeout: const Duration(minutes: 2)),
+        data: {
+          "model": chatModel,
+          "messages":[{"role": "user", "content": prompt}],
+          "temperature": 0.2, // 低温度保证判卷严谨性
+        },
+      );
+      return response.data['choices'][0]['message']['content'].toString().trim();
+    } catch (e) {
+      AppLogger.log("本地批改异常或超时，自动回退至云端大模型: $e", isError: true);
+      return await evaluateUserAnswer(q, userAnswer); // Fallback
     }
   }
 
@@ -1180,6 +1309,32 @@ $question
       return "问答请求异常: $e";
     }
   }
+
+  // [新增] 用于在对话框中根据用户指令动态生成单道题目
+  static Future<ExamQuestion?> generateSingleQuestionFromChat(String contextText, String userIntent) async {
+    final apiKey = await ConfigService.getDeepSeekKey();
+    if (apiKey.isEmpty) throw Exception("未配置云端 API Key");
+
+    final prompt = """基于以下上下文，请满足用户的具体出题意图，生成【一道】高质量的测试题。
+【用户出题意图】：$userIntent
+【知识库上下文】：\n$contextText
+
+必须严格以单个 JSON 对象格式返回（禁止返回数组列表）：
+{"type": "single_choice 或 essay", "question": "题干", "options":["A", "B", "C", "D"], "correct_answer": "正确答案", "analysis": "详细解析"}""";
+
+    try {
+      final response = await _dio.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        options: Options(headers: {"Authorization": "Bearer $apiKey", "Content-Type": "application/json"}),
+        data: {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.4},
+      );
+      String content = _cleanJson(response.data['choices'][0]['message']['content']);
+      return ExamQuestion.fromJson(jsonDecode(content));
+    } catch (e) {
+      AppLogger.log("对话框生成题目异常: $e", isError: true);
+      return null;
+    }
+  }
 }
 
 // ==========================================
@@ -1299,7 +1454,7 @@ class ExamProvider extends ChangeNotifier {
 
   // [终极修复] 通过无限存储 + 动态精准切片组装，彻底规避 400 崩溃
   Future<bool> processAndGenerate({
-    required String rawText, required String topic, required int count, required String difficulty,
+    required String rawText, required String topic, required int count, required String difficulty, String customPrompt = ""
   }) async {
     _isLoading = true;
     _errorMessage = "";
@@ -1342,7 +1497,7 @@ class ExamProvider extends ChangeNotifier {
       // 4. 发送至出题引擎，此时上下文经过精准拼装，绝对安全
       _updateProgress("上下文组装完成，请求云端构建试卷...", 1.0); 
       final result = await DualAIService.generateMixedExam(
-        contextText: processedText, topic: topic, count: count, difficulty: difficulty,
+        contextText: processedText, topic: topic, count: count, difficulty: difficulty, customPrompt: customPrompt, // 传入自定义指令
       );
 
       if (result.containsKey("error")) throw Exception(result["error"]);
@@ -1383,6 +1538,8 @@ class ExamTakingProvider extends ChangeNotifier {
   bool get isEvaluating => _isEvaluating;
   bool get isSubmitted => _isSubmitted;
   double get progress => _questions.isEmpty ? 0 : (_userAnswers.length / _questions.length);
+  // [新增] 暴露当前的 exam 实体给外部
+  SavedExam? get exam => _exam;
 
   void startExam(SavedExam exam) {
     _exam = exam;
@@ -1437,12 +1594,12 @@ class ExamTakingProvider extends ChangeNotifier {
         }
       }
 
-      // 【核心控制】：只有当主观题，或者客观题做错时，才会调用云端大模型，极大降低 API 消耗
       if (isCorrectLocally && q.type != 'essay') {
         score += 1;
-        _aiFeedbacks[i] = "完全正确！掌握得很扎实。"; // 命中缓存分支，无需请求 AI
+        _aiFeedbacks[i] = "完全正确！掌握得很扎实。";
       } else {
-        evalTasks.add(DualAIService.evaluateUserAnswer(q, ans ?? "未作答").then((feedback) {
+        // [核心修改] 调用本地小模型进行阅卷，节省云端 API
+        evalTasks.add(DualAIService.evaluateUserAnswerLocally(q, ans ?? "未作答").then((feedback) {
           _aiFeedbacks[i] = feedback;
         }));
       }
@@ -1574,6 +1731,17 @@ class _HomeScreenState extends State<HomeScreen> {
                               Navigator.push(
                                 context,
                                 MaterialPageRoute(builder: (_) => ChatWithKnowledgeScreen(exam: item))
+                              );
+                            }
+                          ),
+                          // [新增] 题库管理功能
+                          IconButton(
+                            icon: const Icon(Icons.list_alt, color: Colors.teal),
+                            tooltip: "管理题库题目",
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(builder: (_) => ExamQuestionManagerScreen(exam: item))
                               );
                             }
                           ),
@@ -1835,6 +2003,26 @@ class ExamResultScreen extends StatelessWidget {
                               child: _renderMarkdown(q.analysis, shrinkWrap: true)
                             )
                           ],
+                        ),
+                        // [新增] 针对本题进行追问的快捷入口
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton.icon(
+                            icon: const Icon(Icons.question_answer),
+                            label: const Text("对此题有疑惑？向 AI 助教提问"),
+                            onPressed: () {
+                              final initialPrompt = "关于刚才测验中的一道题我不太理解。\n【题目】：${q.question}\n【我的回答是】：${userAns}\n【标准答案是】：${q.correctAnswer}\n请帮我详细分析一下我的思路哪里出了问题？";
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ChatWithKnowledgeScreen(
+                                    exam: provider.exam!, 
+                                    initialMessage: initialPrompt, // 传入自动生成的提问模板
+                                  )
+                                )
+                              );
+                            },
+                          ),
                         )
                       ],
                   ),
@@ -1849,6 +2037,171 @@ class ExamResultScreen extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ==========================================
+// 附加视图层 - 题库管理界面 (文件1新增)
+// ==========================================
+class ExamQuestionManagerScreen extends StatefulWidget {
+  final SavedExam exam;
+  const ExamQuestionManagerScreen({super.key, required this.exam});
+
+  @override
+  State<ExamQuestionManagerScreen> createState() => _ExamQuestionManagerScreenState();
+}
+
+class _ExamQuestionManagerScreenState extends State<ExamQuestionManagerScreen> {
+  late List<ExamQuestion> _questions;
+  
+  @override
+  void initState() {
+    super.initState();
+    _questions = widget.exam.parsedQuestions;
+  }
+
+  void _addQuestion() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("新增题目"),
+        content: const Text("新增题目功能正在开发中..."),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("关闭"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _editQuestion(int index) {
+    final question = _questions[index];
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("编辑题目"),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text("题型: ${question.type}"),
+              const SizedBox(height: 8),
+              Text("题目: ${question.question}"),
+              const SizedBox(height: 8),
+              Text("选项: ${question.options.join(', ')}"),
+              const SizedBox(height: 8),
+              Text("正确答案: ${question.correctAnswer}"),
+              const SizedBox(height: 8),
+              Text("解析: ${question.analysis}"),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("关闭"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _deleteQuestion(int index) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("确认删除"),
+        content: Text("确定要删除题目: ${_questions[index].question.substring(0, math.min(50, _questions[index].question.length))}... 吗？"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("取消"),
+          ),
+          TextButton(
+            onPressed: () {
+              setState(() {
+                _questions.removeAt(index);
+                _saveChanges();
+              });
+              Navigator.pop(ctx);
+            },
+            child: const Text("删除", style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _saveChanges() async {
+    final updatedExam = SavedExam(
+      id: widget.exam.id,
+      title: widget.exam.title,
+      examJson: jsonEncode(_questions.map((q) => q.toJson()).toList()),
+      knowledgeBase: widget.exam.knowledgeBase,
+      createdAt: widget.exam.createdAt,
+    );
+    await DatabaseHelper.updateExam(updatedExam);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 题库已更新")));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("管理题库: ${widget.exam.title}"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: "新增题目",
+            onPressed: _addQuestion,
+          ),
+        ],
+      ),
+      body: _questions.isEmpty
+          ? const Center(child: Text("暂无题目，点击右上角添加按钮新增题目"))
+          : ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: _questions.length,
+              itemBuilder: (context, index) {
+                final question = _questions[index];
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      child: Text("${index + 1}"),
+                    ),
+                    title: Text(
+                      question.question.length > 100
+                          ? "${question.question.substring(0, 100)}..."
+                          : question.question,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    subtitle: Text("题型: ${question.type} | 选项数: ${question.options.length}"),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.edit, color: Colors.blue),
+                          tooltip: "编辑",
+                          onPressed: () => _editQuestion(index),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete, color: Colors.red),
+                          tooltip: "删除",
+                          onPressed: () => _deleteQuestion(index),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
     );
   }
 }
@@ -1942,6 +2295,7 @@ class KnowledgeInputScreen extends StatefulWidget {
 class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   final TextEditingController _topicController = TextEditingController();
   final TextEditingController _textController = TextEditingController();
+  final TextEditingController _customPromptController = TextEditingController(); // [新增] 自定义出题指令框
   int _questionCount = 5;
 
   // --- 升级的状态机：异步任务队列与游标 ---
@@ -1951,6 +2305,12 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   int _activePage = 0; // 当前处理到的页码（用于PDF分页）
   int _totalFilesToProcess = 0;
   int _processedFilesCount = 0;
+
+  // --- [文件1 新增] 状态变量 ---
+  // [修复-问题4] 添加专用于数据库向量化持久化的状态，减轻焦虑
+  bool _isSavingDB = false;
+  String _saveStatus = "";
+  double _saveProgress = 0.0;
 
   bool _enableOCR = true;
   final String _ocrModel = "vision-model";
@@ -2230,7 +2590,13 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     if (_topicController.text.trim().isEmpty || _textController.text.trim().isEmpty) return;
     
     if (_isEditMode) {
-      setState(() => _isProcessingQueue = true);
+      //[修复-问题4] 设置知识库热更新的持久化状态栏
+      setState(() {
+        _isSavingDB = true; // [修改] 使用新的状态
+        _saveProgress = 0.05;
+        _saveStatus = "准备持久化知识库文本更新...";
+      });
+      
       String finalText = _textController.text.trim();
       
       // 触发持久化
@@ -2250,11 +2616,19 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         AppLogger.log("触发数据库热更新，正在重建 Embedding 向量树...");
         await SemanticRetrievalService.buildAndSaveIndex(
           updatedExam.id!, finalText, embeddingModel, lmUrl,
+          onProgress: (status, progress) {
+            if (mounted) {
+              setState(() {
+                _saveStatus = status;
+                _saveProgress = progress;
+              });
+            }
+          }
         );
       }
       
       if (mounted) {
-        setState(() => _isProcessingQueue = false);
+        setState(() => _isSavingDB = false); // [修改] 结束新状态
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 知识库及其向量索引已成功更新")));
         Navigator.pop(context);
       }
@@ -2262,7 +2636,11 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
       // ==== 新建模式：执行出题引擎流程 ====
       final provider = context.read<ExamProvider>();
       final success = await provider.processAndGenerate(
-        topic: _topicController.text.trim(), rawText: _textController.text.trim(), count: _questionCount, difficulty: "中等"
+        topic: _topicController.text.trim(), 
+        rawText: _textController.text.trim(), 
+        count: _questionCount, 
+        difficulty: "中等",
+        customPrompt: _customPromptController.text.trim(), // 传入 UI 中的内容
       );
       if (success && mounted) Navigator.pop(context);
     }
@@ -2298,7 +2676,15 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                   const Spacer(),
                   
                   // [修改] 增加判定挂起状态的 UI
-                  if (_isProcessingQueue) ...[
+                  if (_isSavingDB) ...[
+                    // [修复-问题4] 显示专用的数据库进度条
+                    SizedBox(width: 100, child: LinearProgressIndicator(value: _saveProgress)),
+                    const SizedBox(width: 12),
+                    Text(
+                      _saveStatus,
+                      style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary)
+                    ),
+                  ] else if (_isProcessingQueue) ...[
                     SizedBox(width: 100, child: LinearProgressIndicator(value: progress)),
                     const SizedBox(width: 12),
                     Text(
@@ -2456,6 +2842,18 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                         decoration: const InputDecoration(labelText: "目标出题量", border: OutlineInputBorder()),
                         items:[3, 5, 10, 15].map((e) => DropdownMenuItem(value: e, child: Text("$e 题"))).toList(),
                         onChanged: (v) => setState(() => _questionCount = v!),
+                      ),
+                      const SizedBox(height: 16),
+                      // [新增] 自定义出题指令框
+                      TextField(
+                        controller: _customPromptController,
+                        maxLines: 3, minLines: 1,
+                        decoration: const InputDecoration(
+                          labelText: "自定义出题指令 (选填)",
+                          hintText: "例如：请多出一些关于内存管理的题目；尽量结合实际应用场景出题；不要考过于底层的API等...",
+                          border: OutlineInputBorder(),
+                          prefixIcon: Icon(Icons.psychology_alt),
+                        ),
                       ),
                       const SizedBox(height: 32),
                     ],
