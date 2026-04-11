@@ -173,7 +173,6 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
     }
 
     final embeddingModel = await ConfigService.getEmbeddingModel();
-    final lmUrl = await ConfigService.getLmStudioUrl();
     
     List<String> retrievedChunks =[];
     String relevantContext = "";
@@ -186,7 +185,7 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
         AppLogger.log("Q&A 触发本地 SQLite 向量库检索机制...");
         // 2. 从无限的 SQLite 库中提取 Top-5 的 Chunk 块
         retrievedChunks = await SemanticRetrievalService.searchContext(
-          _currentExam.id!, text, embeddingModel, lmUrl,
+          _currentExam.id!, text,
         );
         
         if (retrievedChunks.isNotEmpty) {
@@ -229,12 +228,11 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
     _chatController.clear();
 
     final embeddingModel = await ConfigService.getEmbeddingModel();
-    final lmUrl = await ConfigService.getLmStudioUrl();
     String relevantContext = "";
     
     // RAG 提取强相关资料
     if (embeddingModel.isNotEmpty && _currentExam.id != null) {
-      final chunks = await SemanticRetrievalService.searchContext(_currentExam.id!, intent, embeddingModel, lmUrl);
+      final chunks = await SemanticRetrievalService.searchContext(_currentExam.id!, intent);
       if (chunks.isNotEmpty) relevantContext = chunks.join("\n\n");
     }
 
@@ -567,121 +565,174 @@ class ThemeProvider extends ChangeNotifier {
   }
 }
 
+// ==========================================
+// 1. 状态管理 - 全局主题与配置 (ConfigService 矩阵化重构)
+// ==========================================
 class ConfigService {
   static const _storage = FlutterSecureStorage();
   
-  // 初始化时迁移现有配置
-  static Future<void> _migrateIfNeeded() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final db = await DatabaseHelper.database;
-      
-      // 检查是否已经迁移过
-      final migrated = await DatabaseHelper.getConfig("config_migrated");
-      if (migrated == "true") return;
-      
-      AppLogger.log("开始迁移配置从 SharedPreferences 到数据库...");
-      
-      // 迁移 LM Studio URL
-      final lmUrl = prefs.getString("lm_studio_url");
-      if (lmUrl != null && lmUrl.isNotEmpty) {
-        await DatabaseHelper.saveConfig("lm_studio_url", lmUrl);
-      }
-      
-      // 迁移模型配置
-      final chatModel = prefs.getString("lm_chat_model");
-      if (chatModel != null && chatModel.isNotEmpty) {
-        await DatabaseHelper.saveConfig("lm_chat_model", chatModel);
-      }
-      
-      final visionModel = prefs.getString("lm_vision_model");
-      if (visionModel != null && visionModel.isNotEmpty) {
-        await DatabaseHelper.saveConfig("lm_vision_model", visionModel);
-      }
-      
-      final rerankModel = prefs.getString("lm_rerank_model");
-      if (rerankModel != null && rerankModel.isNotEmpty) {
-        await DatabaseHelper.saveConfig("lm_rerank_model", rerankModel);
-      }
-      
-      final embeddingModel = prefs.getString("lm_embedding_model");
-      if (embeddingModel != null && embeddingModel.isNotEmpty) {
-        await DatabaseHelper.saveConfig("lm_embedding_model", embeddingModel);
-      }
-      
-      // 迁移 enable_rerank
-      final enableRerank = prefs.getBool("enable_rerank");
-      if (enableRerank != null) {
-        await DatabaseHelper.saveConfig("enable_rerank", enableRerank.toString());
-      }
-      
-      // 标记为已迁移
-      await DatabaseHelper.saveConfig("config_migrated", "true");
-      AppLogger.log("配置迁移完成");
-    } catch (e) {
-      AppLogger.log("配置迁移失败: $e", isError: true);
+  static Future<void> _migrateToMatrix() async {
+    final migrated = await DatabaseHelper.getConfig("matrix_migrated_v6");
+    if (migrated == "true") return;
+
+    AppLogger.log("正在执行配置降维打击：将全局配置解耦为独立算子矩阵...");
+    String globalPrimary = await DatabaseHelper.getConfig("primary_engine") ?? "cloud";
+    String globalCloudUrl = await DatabaseHelper.getConfig("cloud_api_url") ?? "https://api.deepseek.com/v1";
+    String globalCloudKey = await DatabaseHelper.getConfig("cloud_api_key") ?? await _storage.read(key: "deepseek_key") ?? "";
+    String globalLocalUrl = await DatabaseHelper.getConfig("lm_studio_url") ?? "http://localhost:1234/v1";
+
+    // 循环为四大引擎赋予独立配置副本
+    for (String task in['chat', 'vision', 'rerank', 'embedding']) {
+       await setConfigString('${task}_engine', globalPrimary);
+       await setConfigString('${task}_cloud_url', globalCloudUrl);
+       await setConfigString('${task}_cloud_key', globalCloudKey);
+       await setConfigString('${task}_local_url', globalLocalUrl);
+       await setConfigString('${task}_local_key', "lm-studio");
     }
-  }
-  
-  static Future<String> getDeepSeekKey() async => await _storage.read(key: "deepseek_key") ?? "";
-  static Future<void> saveDeepSeekKey(String key) async => await _storage.write(key: "deepseek_key", value: key);
 
-  static Future<String> getLmStudioUrl() async {
-    await _migrateIfNeeded();
-    final value = await DatabaseHelper.getConfig("lm_studio_url");
-    return value ?? "http://localhost:1234/v1";
-  }
-  static Future<void> saveLmStudioUrl(String url) async {
-    await DatabaseHelper.saveConfig("lm_studio_url", url);
-  }
+    // 映射旧版模型名称
+    await setConfigString('chat_cloud_model', await DatabaseHelper.getConfig("cloud_model_id") ?? "deepseek-chat");
+    await setConfigString('chat_local_model', await DatabaseHelper.getConfig("lm_chat_model") ?? "");
+    await setConfigString('vision_cloud_model', await DatabaseHelper.getConfig("cloud_vision_model") ?? "gpt-4o-mini");
+    await setConfigString('vision_local_model', await DatabaseHelper.getConfig("lm_vision_model") ?? "");
+    await setConfigString('rerank_cloud_model', await DatabaseHelper.getConfig("cloud_rerank_model") ?? "deepseek-chat");
+    await setConfigString('rerank_local_model', await DatabaseHelper.getConfig("lm_rerank_model") ?? "");
+    await setConfigString('embedding_cloud_model', await DatabaseHelper.getConfig("cloud_embedding_model") ?? "text-embedding-v1");
+    await setConfigString('embedding_local_model', await DatabaseHelper.getConfig("lm_embedding_model") ?? "");
 
-  // ==== 动态模型标识配置 ====
-  static Future<String> getChatModel() async {
-    await _migrateIfNeeded();
-    final value = await DatabaseHelper.getConfig("lm_chat_model");
-    return value ?? "local-model";
-  }
-  static Future<void> saveChatModel(String model) async {
-    await DatabaseHelper.saveConfig("lm_chat_model", model);
+    await DatabaseHelper.saveConfig("matrix_migrated_v6", "true");
+    AppLogger.log("矩阵配置升维完成！");
   }
 
-  static Future<String> getVisionModel() async {
-    await _migrateIfNeeded();
-    final value = await DatabaseHelper.getConfig("lm_vision_model");
-    return value ?? "vision-model";
-  }
-  static Future<void> saveVisionModel(String model) async {
-    await DatabaseHelper.saveConfig("lm_vision_model", model);
+  /// 泛型字符获取接口
+  static Future<String> getConfigString(String key, String defaultValue) async {
+    await _migrateToMatrix();
+    return await DatabaseHelper.getConfig(key) ?? defaultValue;
   }
 
-  static Future<String> getRerankModel() async {
-    await _migrateIfNeeded();
-    final value = await DatabaseHelper.getConfig("lm_rerank_model");
-    return value ?? "";
-  }
-  static Future<void> saveRerankModel(String model) async {
-    await DatabaseHelper.saveConfig("lm_rerank_model", model);
+  /// 泛型字符写入接口
+  static Future<void> setConfigString(String key, String value) async {
+    await DatabaseHelper.saveConfig(key, value);
   }
 
-  static Future<String> getEmbeddingModel() async {
-    await _migrateIfNeeded();
-    final value = await DatabaseHelper.getConfig("lm_embedding_model");
-    return value ?? "";
-  }
-  static Future<void> saveEmbeddingModel(String model) async {
-    await DatabaseHelper.saveConfig("lm_embedding_model", model);
-  }
-
-  // 获取是否启用rerank功能
+  // 保持原有 Rerank 全局开关兼容性
   static Future<bool> getEnableRerank() async {
-    await _migrateIfNeeded();
+    await _migrateToMatrix();
     final value = await DatabaseHelper.getConfig("enable_rerank");
-    if (value == null) return false;
-    return value.toLowerCase() == "true";
+    return value?.toLowerCase() == "true";
   }
-  
   static Future<void> setEnableRerank(bool enable) async {
     await DatabaseHelper.saveConfig("enable_rerank", enable.toString());
+  }
+
+  // ==========================================
+  // 兼容层：为现有代码提供向后兼容的接口
+  // ==========================================
+  
+  // 云端 API Key 兼容
+  static Future<String> getCloudApiKey() async {
+    // 从矩阵中获取 chat_cloud_key 作为默认云端密钥
+    return await getConfigString('chat_cloud_key', '');
+  }
+  static Future<void> saveCloudApiKey(String key) async {
+    // 保存到所有任务的云端密钥配置
+    for (String task in['chat', 'vision', 'rerank', 'embedding']) {
+      await setConfigString('${task}_cloud_key', key);
+    }
+  }
+
+  // 云端 API URL 兼容
+  static Future<String> getCloudApiUrl() async {
+    return await getConfigString('chat_cloud_url', 'https://api.deepseek.com/v1');
+  }
+  static Future<void> saveCloudApiUrl(String url) async {
+    for (String task in['chat', 'vision', 'rerank', 'embedding']) {
+      await setConfigString('${task}_cloud_url', url);
+    }
+  }
+
+  // 云端模型 ID 兼容
+  static Future<String> getCloudModelId() async {
+    return await getConfigString('chat_cloud_model', 'deepseek-chat');
+  }
+  static Future<void> saveCloudModelId(String model) async {
+    await setConfigString('chat_cloud_model', model);
+  }
+
+  // 云端视觉模型 ID 兼容
+  static Future<String> getCloudVisionModelId() async {
+    return await getConfigString('vision_cloud_model', 'gpt-4o-mini');
+  }
+  static Future<void> saveCloudVisionModelId(String model) async {
+    await setConfigString('vision_cloud_model', model);
+  }
+
+  // 云端 Rerank 模型 ID 兼容
+  static Future<String> getCloudRerankModelId() async {
+    return await getConfigString('rerank_cloud_model', 'deepseek-chat');
+  }
+  static Future<void> saveCloudRerankModelId(String model) async {
+    await setConfigString('rerank_cloud_model', model);
+  }
+
+  // 云端 Embedding 模型 ID 兼容
+  static Future<String> getCloudEmbeddingModelId() async {
+    return await getConfigString('embedding_cloud_model', 'text-embedding-v1');
+  }
+  static Future<void> saveCloudEmbeddingModelId(String model) async {
+    await setConfigString('embedding_cloud_model', model);
+  }
+
+  // 主引擎选择兼容
+  static Future<String> getPrimaryEngine() async {
+    return await getConfigString('chat_engine', 'cloud');
+  }
+  static Future<void> savePrimaryEngine(String engine) async {
+    for (String task in['chat', 'vision', 'rerank', 'embedding']) {
+      await setConfigString('${task}_engine', engine);
+    }
+  }
+
+  // LM Studio URL 兼容
+  static Future<String> getLmStudioUrl() async {
+    return await getConfigString('chat_local_url', 'http://localhost:1234/v1');
+  }
+  static Future<void> saveLmStudioUrl(String url) async {
+    for (String task in['chat', 'vision', 'rerank', 'embedding']) {
+      await setConfigString('${task}_local_url', url);
+    }
+  }
+
+  // 本地聊天模型兼容
+  static Future<String> getChatModel() async {
+    return await getConfigString('chat_local_model', 'local-model');
+  }
+  static Future<void> saveChatModel(String model) async {
+    await setConfigString('chat_local_model', model);
+  }
+
+  // 本地视觉模型兼容
+  static Future<String> getVisionModel() async {
+    return await getConfigString('vision_local_model', 'vision-model');
+  }
+  static Future<void> saveVisionModel(String model) async {
+    await setConfigString('vision_local_model', model);
+  }
+
+  // 本地 Rerank 模型兼容
+  static Future<String> getRerankModel() async {
+    return await getConfigString('rerank_local_model', '');
+  }
+  static Future<void> saveRerankModel(String model) async {
+    await setConfigString('rerank_local_model', model);
+  }
+
+  // 本地 Embedding 模型兼容
+  static Future<String> getEmbeddingModel() async {
+    return await getConfigString('embedding_local_model', '');
+  }
+  static Future<void> saveEmbeddingModel(String model) async {
+    await setConfigString('embedding_local_model', model);
   }
 }
 
@@ -785,13 +836,13 @@ class ExamRecord {
       return _database!;
     }
 
-    static Future<Database> _initDB() async {
-      final docDir = io.Directory('${io.Platform.environment['HOME']}/.ai_teacher');
-      if (!await docDir.exists()) await docDir.create(recursive: true);
-      String dbPath = path.join(docDir.path, 'exams_v2.db'); 
-      
-      // [修改] 版本升级至 4，引入 app_config 表用于持久化模型配置
-      return await openDatabase(dbPath, version: 4, onCreate: (db, version) async {
+  static Future<Database> _initDB() async {
+    final docDir = io.Directory('${io.Platform.environment['HOME']}/.ai_teacher');
+    if (!await docDir.exists()) await docDir.create(recursive: true);
+    String dbPath = path.join(docDir.path, 'exams_v2.db'); 
+    
+    // [修改] 版本升级至 4，引入 app_config 表用于持久化模型配置
+    return await openDatabase(dbPath, version: 4, onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE saved_exams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -970,21 +1021,50 @@ class DualAIService {
     return raw.replaceAll(RegExp(r'^```json\s*|^```\s*', multiLine: true), '').replaceAll(RegExp(r'```$'), '').trim();
   }
 
+  /// [终极版] 全矩阵动态网关：所有任务各自独立路由
+  static Future<Map<String, dynamic>> _buildEngineContext({String taskType = 'chat'}) async {
+    // 1. 获取当前特定任务的引擎归属 (cloud 或 local)
+    String engine = await ConfigService.getConfigString('${taskType}_engine', 'cloud'); 
+    
+    // 2. 根据归属拉取独立的 URL、Key 和 Model
+    String url = await ConfigService.getConfigString('${taskType}_${engine}_url', engine == 'cloud' ? 'https://api.deepseek.com/v1' : 'http://localhost:1234/v1');
+    String key = await ConfigService.getConfigString('${taskType}_${engine}_key', '');
+    String model = await ConfigService.getConfigString('${taskType}_${engine}_model', '');
+
+    if (url.isEmpty) throw Exception("⚠️ [$taskType] 业务流的 $engine 节点 URL 缺失，请前往设置面板配置");
+
+    // 3. 智能拼接路由（自动适配 OpenAI 标准后端）
+    String cleanBaseUrl = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
+    String apiUrl = taskType == 'embedding' ? "$cleanBaseUrl/embeddings" : "$cleanBaseUrl/chat/completions";
+
+    AppLogger.log("🔀 路由分配 | 业务流: [$taskType] -> 节点: $engine -> 模型: $model");
+
+    return {
+      "url": apiUrl,
+      "key": key.isEmpty ? "default-token" : key,
+      "model": model,
+      "isLocal": engine == 'local'
+    };
+  }
+
+  /// [修改] Rerank 接入动态网关
   static Future<String> _rerankContent(String context) async {
     final enableRerank = await ConfigService.getEnableRerank();
     if (!enableRerank) return context;
     
-    final rerankModel = await ConfigService.getRerankModel();
-    if (rerankModel.isEmpty) return context;
+    final engineCtx = await _buildEngineContext(taskType: 'rerank');
+    if ((engineCtx["model"] as String).isEmpty) return context;
     
-    AppLogger.log("启动 Rerank 优化模型：正在剥离无关噪声...");
-    final localUrl = await ConfigService.getLmStudioUrl();
+    AppLogger.log("启动 Rerank 优化模型 [${engineCtx["model"]}]：正在剥离无关噪声...");
     try {
       final response = await _dio.post(
-        '$localUrl/chat/completions',
-        options: Options(receiveTimeout: const Duration(minutes: 5)), // 放宽超时限制
+        engineCtx["url"],
+        options: Options(
+          headers: {"Authorization": "Bearer ${engineCtx["key"]}", "Content-Type": "application/json"},
+          receiveTimeout: const Duration(minutes: 5)
+        ),
         data: {
-          "model": rerankModel, 
+          "model": engineCtx["model"], 
           "messages":[
             {"role": "system", "content": "你是一个文本重排序专家。请对输入的文本进行重新排序，将最重要的内容放在前面，按重要性递减的顺序排列。"},
             {"role": "user", "content": "请对以下文本进行重排序：\n\n文本：$context"}
@@ -996,7 +1076,7 @@ class DualAIService {
       AppLogger.log("Rerank 处理完毕，消耗 Tokens: [Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
       return response.data['choices'][0]['message']['content'];
     } catch (e) {
-      AppLogger.log("Rerank 模型返回异常，回退至原始内容", isError: true);
+      AppLogger.log("Rerank 模型返回异常，回退至原始内容: $e", isError: true);
       return context; 
     }
   }
@@ -1029,19 +1109,20 @@ class DualAIService {
     }
   }
 
-  // [修改] 增加 customPrompt 入参
+  /// [核心方法修改] 混合出题引擎，对接动态网关
   static Future<Map<String, dynamic>> generateMixedExam({
     required String contextText, required String topic, required int count, required String difficulty, String customPrompt = "",
   }) async {
-    final apiKey = await ConfigService.getDeepSeekKey();
-    if (apiKey.isEmpty) {
-      AppLogger.log("未配置云端 DeepSeek API Key", isError: true);
-      return {"error": "未配置云端验证模型 (DeepSeek) API Key"};
+    final engineCtx = await _buildEngineContext();
+    if (!engineCtx["isLocal"] && (engineCtx["key"] as String).isEmpty) {
+      AppLogger.log("云端引擎缺失 API Key", isError: true);
+      return {"error": "尚未配置云端 API Key，请前往设置面板配置或切换至本地模型"};
     }
 
-    String draftedIdeas = await _draftIdeasLocally(contextText, count);
+    // 局部本地考点提炼保持不变
+    await _draftIdeasLocally(contextText, count);
 
-    AppLogger.log("向云端大模型 (DeepSeek) 请求最终 JSON 混合题型构建...");
+    AppLogger.log("向核心推理网关 [${engineCtx["model"]}] 请求最终 JSON 混合题型构建...");
     final prompt = """你是一个资深的学科出题专家。请基于以下提供的【知识库检索上下文】，针对主题【$topic】，生成一份高质量的混合题型试卷。
 出题严格要求：
 1. 题量：$count 道。难度：$difficulty。
@@ -1052,13 +1133,13 @@ class DualAIService {
 
     try {
       final response = await _dio.post(
-        "https://api.deepseek.com/v1/chat/completions",
+        engineCtx["url"],
         options: Options(
-          headers: {"Authorization": "Bearer $apiKey", "Content-Type": "application/json"},
+          headers: {"Authorization": "Bearer ${engineCtx["key"]}", "Content-Type": "application/json"},
           receiveTimeout: const Duration(minutes: 5),
         ),
         data: {
-          "model": "deepseek-chat",
+          "model": engineCtx["model"],
           "messages":[
             {"role": "system", "content": "你是一个严格的 JSON 出题机器。"},
             {"role": "user", "content": prompt}
@@ -1067,21 +1148,22 @@ class DualAIService {
         },
       );
       final usage = response.data['usage'];
-      AppLogger.log("云端试卷构建成功！云端消耗 Tokens:[Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
+      AppLogger.log("试卷构建成功！消耗 Tokens: [Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
       
       String content = response.data['choices'][0]['message']['content'];
       return jsonDecode(_cleanJson(content));
     } catch (e) {
-      AppLogger.log("云端出题请求异常: $e", isError: true);
+      AppLogger.log("出题请求网关异常: $e", isError: true);
       return {"error": "API 请求异常: $e"};
     }
   }
 
-  // --- OCR 与评估方法由于类似，我只写关键埋点 ---
+  /// [修改] 视觉模型 OCR 接入动态网关 (保留原方法名避免调用层报错)
   static Future<String> performLocalOCR(String filePath, {int maxRetries = 3}) async {
-    final localUrl = await ConfigService.getLmStudioUrl();
-    final visionModel = await ConfigService.getVisionModel();
-    AppLogger.log("触发视觉处理模型，正在解析: ${path.basename(filePath)}");
+    final engineCtx = await _buildEngineContext(taskType: 'vision');
+    if ((engineCtx["model"] as String).isEmpty) return "[未配置视觉模型]";
+
+    AppLogger.log("触发视觉处理模型 [${engineCtx["model"]}]，正在解析: ${path.basename(filePath)}");
 
     final bytes = await io.File(filePath).readAsBytes();
     final base64Img = base64Encode(bytes);
@@ -1090,10 +1172,14 @@ class DualAIService {
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         final response = await _dio.post(
-          '$localUrl/chat/completions',
-          options: Options(receiveTimeout: const Duration(minutes: 5), validateStatus: (s) => s != null && s < 600),
+          engineCtx["url"],
+          options: Options(
+            headers: {"Authorization": "Bearer ${engineCtx["key"]}", "Content-Type": "application/json"},
+            receiveTimeout: const Duration(minutes: 5), 
+            validateStatus: (s) => s != null && s < 600
+          ),
           data: {
-            "model": visionModel, 
+            "model": engineCtx["model"], 
             "messages":[{"role": "user", "content":[{"type": "text", "text": "提取图片中的所有文本信息,但是也请描述图片内容,特别是示意图,请直接输出信息。"},{"type": "image_url", "image_url": {"url": "data:$mimeType;base64,$base64Img"}}]}]
           },
         );
@@ -1113,7 +1199,7 @@ class DualAIService {
 
   /// 阶段三：针对考生特定回答进行形成性分析 (云端大模型)
   static Future<String> evaluateUserAnswer(ExamQuestion q, dynamic userAnswer) async {
-    final apiKey = await ConfigService.getDeepSeekKey();
+    final apiKey = await ConfigService.getCloudApiKey();
     if (apiKey.isEmpty) return "AI 评价服务未就绪";
 
     final prompt = """
@@ -1183,7 +1269,7 @@ class DualAIService {
 
   /// 新增：基于持久化的历史记录，生成个性化指导
   static Future<String> generatePersonalizedGuidance(String examTitle, List<ExamRecord> records, List<ExamQuestion> questions) async {
-    final apiKey = await ConfigService.getDeepSeekKey();
+    final apiKey = await ConfigService.getCloudApiKey();
     if (apiKey.isEmpty) return "未配置云端 API Key";
 
     // 提取所有错题和历史反馈日志以压缩 prompt
@@ -1219,7 +1305,7 @@ ${jsonEncode(errorLogs)}
 
   /// 生成用于辅助理解的 DAG 图 (基于 Mermaid graph TD 语法)
   static Future<String> generateKnowledgeDAG(String contextText) async {
-    final apiKey = await ConfigService.getDeepSeekKey();
+    final apiKey = await ConfigService.getCloudApiKey();
     if (apiKey.isEmpty) {
       AppLogger.log("DAG 生成失败: 未配置云端 API Key", isError: true);
       return "错误: 未配置云端 API Key";
@@ -1266,7 +1352,7 @@ $contextText
 
   /// [新增] 基于本地提取上下文的 Q&A 问答生成 (云端大模型)
   static Future<String> answerQuestionWithContext(String question, String contextText) async {
-    final apiKey = await ConfigService.getDeepSeekKey();
+    final apiKey = await ConfigService.getCloudApiKey();
     if (apiKey.isEmpty) return "错误: 未配置云端 API Key";
 
     final prompt = """
@@ -1312,7 +1398,7 @@ $question
 
   // [新增] 用于在对话框中根据用户指令动态生成单道题目
   static Future<ExamQuestion?> generateSingleQuestionFromChat(String contextText, String userIntent) async {
-    final apiKey = await ConfigService.getDeepSeekKey();
+    final apiKey = await ConfigService.getCloudApiKey();
     if (apiKey.isEmpty) throw Exception("未配置云端 API Key");
 
     final prompt = """基于以下上下文，请满足用户的具体出题意图，生成【一道】高质量的测试题。
@@ -1332,6 +1418,43 @@ $question
       return ExamQuestion.fromJson(jsonDecode(content));
     } catch (e) {
       AppLogger.log("对话框生成题目异常: $e", isError: true);
+      return null;
+    }
+  }
+
+  /// [新增] AI 辅助题库优化器 (为UI侧"AI 润色"功能提供后端服务)
+  static Future<ExamQuestion?> optimizeQuestion(ExamQuestion draft, String optimizationIntent) async {
+    final engineCtx = await _buildEngineContext();
+    
+    final prompt = """
+你是一个资深的学科教研专家。请根据以下【优化诉求】，对下方给出的【题目草稿】进行润色和结构优化。
+要求：
+1. 修复语法、标点漏洞，提升严谨度。
+2. 确保选项之间没有歧义。
+3. 必须以单个严谨的 JSON 格式返回，包含优化后的结构：{"type": "${draft.type}", "question": "优化后的题干", "options":["A", "B", "C", "D"], "correct_answer": "正确答案", "analysis": "详细解析"}
+
+【优化诉求】：${optimizationIntent.isEmpty ? "常规化教研润色，提升学术性" : optimizationIntent}
+【题目草稿】：
+${jsonEncode(draft.toJson())}
+""";
+
+    try {
+      final response = await _dio.post(
+        engineCtx["url"],
+        options: Options(
+          headers: {"Authorization": "Bearer ${engineCtx["key"]}", "Content-Type": "application/json"},
+          receiveTimeout: const Duration(minutes: 2),
+        ),
+        data: {
+          "model": engineCtx["model"],
+          "messages": [{"role": "user", "content": prompt}],
+          "temperature": 0.2,
+        },
+      );
+      String content = _cleanJson(response.data['choices'][0]['message']['content']);
+      return ExamQuestion.fromJson(jsonDecode(content));
+    } catch (e) {
+      AppLogger.log("题目优化异常: $e", isError: true);
       return null;
     }
   }
@@ -1367,8 +1490,13 @@ class SemanticRetrievalService {
     return dotProduct / (math.sqrt(normA) * math.sqrt(normB));
   }
 
-  /// [新增] 持久化构建本地向量索引（由知识库保存时触发）
-  static Future<void> buildAndSaveIndex(int examId, String rawText, String model, String baseUrl, {Function(String, double)? onProgress}) async {
+  /// [核心修改] 统一由网关动态调拨，带上 Authorization 头规避 401 拦截
+  static Future<void> buildAndSaveIndex(int examId, String rawText, {Function(String, double)? onProgress}) async {
+    final engineCtx = await DualAIService._buildEngineContext(taskType: 'embedding');
+    final String model = engineCtx["model"];
+    final String url = engineCtx["url"];
+    final String key = engineCtx["key"];
+
     if (model.isEmpty || rawText.isEmpty) return;
     
     onProgress?.call("正在进行文本语义分块...", 0.1);
@@ -1376,18 +1504,21 @@ class SemanticRetrievalService {
     List<Map<String, dynamic>> dbRecords = [];
 
     for (int i = 0; i < chunks.length; i++) {
-      onProgress?.call("本地 Embedding 向量化: 第 ${i + 1}/${chunks.length} 块", 0.1 + 0.8 * (i / chunks.length));
+      onProgress?.call("向量化提取: 第 ${i + 1}/${chunks.length} 块", 0.1 + 0.8 * (i / chunks.length));
       try {
         final response = await _dio.post(
-          '$baseUrl/embeddings',
+          url,
+          options: Options(
+            headers: {"Authorization": "Bearer $key", "Content-Type": "application/json"},
+            receiveTimeout: const Duration(seconds: 30)
+          ),
           data: {"model": model, "input": chunks[i]},
-          options: Options(receiveTimeout: const Duration(seconds: 30)),
         );
         final vector = List<double>.from(response.data['data'][0]['embedding']);
         dbRecords.add({
           'examId': examId,
           'chunkText': chunks[i],
-          'vectorJson': jsonEncode(vector), // 转为 JSON 字符串入库
+          'vectorJson': jsonEncode(vector), 
         });
       } catch (e) {
         AppLogger.log("第 $i 块 Embedding 失败: $e", isError: true);
@@ -1399,8 +1530,13 @@ class SemanticRetrievalService {
     AppLogger.log("✅ 题库 ID:$examId 的向量索引构建完成，共存入 ${dbRecords.length} 个切片。");
   }
 
-  /// [修改] 检索时直接利用 SQLite 内的向量进行余弦匹配，并返回原文 List<String> 供 UI 溯源展示
-  static Future<List<String>> searchContext(int examId, String query, String model, String baseUrl) async {
+  /// [核心修改] 调整检索引擎对接
+  static Future<List<String>> searchContext(int examId, String query) async {
+    final engineCtx = await DualAIService._buildEngineContext(taskType: 'embedding');
+    final String model = engineCtx["model"];
+    final String url = engineCtx["url"];
+    final String key = engineCtx["key"];
+
     if (model.isEmpty) return [];
 
     List<Map<String, dynamic>> savedVectors = await DatabaseHelper.getEmbeddingsForExam(examId);
@@ -1408,7 +1544,11 @@ class SemanticRetrievalService {
 
     List<double> queryVector = [];
     try {
-      final qRes = await _dio.post('$baseUrl/embeddings', data: {"model": model, "input": query});
+      final qRes = await _dio.post(
+        url, 
+        options: Options(headers: {"Authorization": "Bearer $key", "Content-Type": "application/json"}),
+        data: {"model": model, "input": query}
+      );
       queryVector = List<double>.from(qRes.data['data'][0]['embedding']);
     } catch (e) {
       AppLogger.log("主题向量生成失败: $e", isError: true);
@@ -1424,7 +1564,7 @@ class SemanticRetrievalService {
     
     scoredChunks.sort((a, b) => b.value.compareTo(a.value));
     
-    int maxSelected = math.min(5, scoredChunks.length);
+    int maxSelected = math.min(10, scoredChunks.length);
     return scoredChunks.take(maxSelected).map((e) => e.key).toList();
   }
 }
@@ -1461,10 +1601,9 @@ class ExamProvider extends ChangeNotifier {
     _updateProgress("引擎启动中...", 0.0);
 
     try {
-      if ((await ConfigService.getDeepSeekKey()).isEmpty) throw Exception("请先在设置中配置云端 API Key");
+      if ((await ConfigService.getCloudApiKey()).isEmpty) throw Exception("请先在设置中配置云端 API Key");
       
       final embeddingModel = await ConfigService.getEmbeddingModel();
-      final lmUrl = await ConfigService.getLmStudioUrl();
       if (embeddingModel.isEmpty) {
         throw Exception("🚨 为了保障超长文本处理的绝对稳定，必须前置配置 Embedding 模型进行向量化！请前往设置填写。");
       }
@@ -1475,11 +1614,11 @@ class ExamProvider extends ChangeNotifier {
 
       // 1. 无限切片并建立向量树索引：不受文本总长度限制，依靠 SQLite 处理海量切块
       _updateProgress("正在进行文本碎片化与向量树重构...", 0.10);
-      await SemanticRetrievalService.buildAndSaveIndex(currentExamId, rawText, embeddingModel, lmUrl, onProgress: _updateProgress);
+      await SemanticRetrievalService.buildAndSaveIndex(currentExamId, rawText, onProgress: _updateProgress);
 
       // 2. 动态精准拼装上下文：利用主题词提取 Top-5 知识域切片 (数学期望字数 < 3000)，完美兼容 4096 Tokens 限制
       _updateProgress("正在从向量库提取 '$topic' 的高维特征片段...", 0.90);
-      final chunks = await SemanticRetrievalService.searchContext(currentExamId, topic, embeddingModel, lmUrl);
+      final chunks = await SemanticRetrievalService.searchContext(currentExamId, topic);
       String processedText = chunks.join("\n\n");
       
       // Fallback: 兜底保护
@@ -1611,7 +1750,7 @@ class ExamTakingProvider extends ChangeNotifier {
       examId: _exam!.id!,
       score: score,
       userAnswersJson: jsonEncode(_userAnswers.map((key, value) => MapEntry(key.toString(), value?.toString() ?? "null"))),
-      aiFeedbackJson: jsonEncode(_aiFeedbacks.map((key, value) => MapEntry(key.toString(), value?.toString() ?? "null"))),
+      aiFeedbackJson: jsonEncode(_aiFeedbacks.map((key, value) => MapEntry(key.toString(), value.toString()))),
       createdAt: DateTime.now().millisecondsSinceEpoch
     );
     await DatabaseHelper.saveExamRecord(record);
@@ -1779,6 +1918,14 @@ class ExamTakingScreen extends StatefulWidget {
 class _ExamTakingScreenState extends State<ExamTakingScreen> {
   final TextEditingController _textController = TextEditingController();
 
+  void _handleGoNext(ExamTakingProvider provider) {
+    if (provider.currentIndex < provider.questions.length - 1) {
+      provider.nextQuestion();
+    } else {
+      provider.submitExam();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer<ExamTakingProvider>(
@@ -1804,64 +1951,77 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
           if (_textController.text != (currentAns ?? "")) _textController.text = (currentAns ?? "");
         }
 
-        return Scaffold(
-          appBar: AppBar(
-            title: Text("正在答题：${widget.exam.title}"),
-            bottom: PreferredSize(
-              preferredSize: const Size.fromHeight(4.0),
-              child: LinearProgressIndicator(value: provider.progress, backgroundColor: Colors.grey.withOpacity(0.2)),
+        // [修改核心] 使用 Focus 包裹 Scaffold，监听全局硬件回车键
+        return Focus(
+          autofocus: true,
+          onKeyEvent: (FocusNode node, KeyEvent event) {
+            // 拦截实体回车键（排除简答题，防止干扰正常打字换行）
+            if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.enter) {
+              if (q.type != 'essay') {
+                _handleGoNext(provider);
+                return KeyEventResult.handled;
+              }
+            }
+            return KeyEventResult.ignored;
+          },
+          child: Scaffold(
+            appBar: AppBar(
+              title: Text("正在答题：${widget.exam.title}"),
+              bottom: PreferredSize(
+                preferredSize: const Size.fromHeight(4.0),
+                child: LinearProgressIndicator(value: provider.progress, backgroundColor: Colors.grey.withOpacity(0.2)),
+              ),
             ),
-          ),
-          body: Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children:[
-                Text("题目 ${provider.currentIndex + 1} / ${provider.questions.length}", style: const TextStyle(fontSize: 14, color: Colors.grey)),
-                const SizedBox(height: 8),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children:[
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(color: Theme.of(context).colorScheme.primaryContainer, borderRadius: BorderRadius.circular(4)),
-                      child: Text(_getFormatTypeName(q.type), style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer, fontSize: 12)),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(child: _renderMarkdown("### " + q.question, shrinkWrap: true)), // 使用 markdown H3 维持字号与加粗
-                  ],
-                ),
-                const SizedBox(height: 24),
-                
-                // 动态渲染答题组件
-                Expanded(
-                  child: SingleChildScrollView(
-                    child: _buildInputWidget(q, currentAns, provider),
-                  ),
-                ),
-
-                const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children:[
-                    OutlinedButton(
-                      onPressed: provider.currentIndex > 0 ? () => provider.prevQuestion() : null,
-                      child: const Text("上一题"),
-                    ),
-                    provider.currentIndex < provider.questions.length - 1
-                    ? FilledButton(
-                        onPressed: () => provider.nextQuestion(),
-                        child: const Text("下一题"),
-                      )
-                    : FilledButton.icon(
-                        icon: const Icon(Icons.check),
-                        label: const Text("提交评卷"),
-                        style: FilledButton.styleFrom(backgroundColor: Colors.green),
-                        onPressed: () => provider.submitExam(),
+            body: Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children:[
+                  Text("题目 ${provider.currentIndex + 1} / ${provider.questions.length}", style: const TextStyle(fontSize: 14, color: Colors.grey)),
+                  const SizedBox(height: 8),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children:[
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(color: Theme.of(context).colorScheme.primaryContainer, borderRadius: BorderRadius.circular(4)),
+                        child: Text(_getFormatTypeName(q.type), style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer, fontSize: 12)),
                       ),
-                  ],
-                )
-              ],
+                      const SizedBox(width: 8),
+                      Expanded(child: _renderMarkdown("### " + q.question, shrinkWrap: true)), 
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: _buildInputWidget(q, currentAns, provider),
+                    ),
+                  ),
+
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children:[
+                      OutlinedButton(
+                        onPressed: provider.currentIndex > 0 ? () => provider.prevQuestion() : null,
+                        child: const Text("上一题"),
+                      ),
+                      provider.currentIndex < provider.questions.length - 1
+                      ? FilledButton(
+                          onPressed: () => provider.nextQuestion(),
+                          child: const Text("下一题 (Enter)"), // [增加提示]
+                        )
+                      : FilledButton.icon(
+                          icon: const Icon(Icons.check),
+                          label: const Text("提交评卷 (Enter)"),
+                          style: FilledButton.styleFrom(backgroundColor: Colors.green),
+                          onPressed: () => provider.submitExam(),
+                        ),
+                    ],
+                  )
+                ],
+              ),
             ),
           ),
         );
@@ -1950,7 +2110,6 @@ class ExamResultScreen extends StatelessWidget {
               int idx = entry.key; ExamQuestion q = entry.value;
               String aiFeedback = provider.aiFeedbacks[idx] ?? "无反馈数据";
               dynamic userAns = provider.userAnswers[idx] ?? "未作答";
-              bool isCorrect = aiFeedback.contains("完全正确");
 
               return Card(
                 elevation: 2, margin: const EdgeInsets.only(bottom: 24),
@@ -2042,7 +2201,7 @@ class ExamResultScreen extends StatelessWidget {
 }
 
 // ==========================================
-// 附加视图层 - 题库管理界面 (文件1新增)
+// 附加视图层 - 题库管理界面 (替换原有 _ExamQuestionManagerScreenState)
 // ==========================================
 class ExamQuestionManagerScreen extends StatefulWidget {
   final SavedExam exam;
@@ -2058,56 +2217,26 @@ class _ExamQuestionManagerScreenState extends State<ExamQuestionManagerScreen> {
   @override
   void initState() {
     super.initState();
-    _questions = widget.exam.parsedQuestions;
+    _questions = List.from(widget.exam.parsedQuestions);
   }
 
-  void _addQuestion() {
-    showDialog(
+  void _openEditorDialog({ExamQuestion? initialData, int? editIndex}) async {
+    final result = await showDialog<ExamQuestion>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("新增题目"),
-        content: const Text("新增题目功能正在开发中..."),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("关闭"),
-          ),
-        ],
-      ),
+      barrierDismissible: false,
+      builder: (ctx) => QuestionEditorDialog(initialData: initialData),
     );
-  }
 
-  void _editQuestion(int index) {
-    final question = _questions[index];
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("编辑题目"),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text("题型: ${question.type}"),
-              const SizedBox(height: 8),
-              Text("题目: ${question.question}"),
-              const SizedBox(height: 8),
-              Text("选项: ${question.options.join(', ')}"),
-              const SizedBox(height: 8),
-              Text("正确答案: ${question.correctAnswer}"),
-              const SizedBox(height: 8),
-              Text("解析: ${question.analysis}"),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("关闭"),
-          ),
-        ],
-      ),
-    );
+    if (result != null) {
+      setState(() {
+        if (editIndex != null) {
+          _questions[editIndex] = result;
+        } else {
+          _questions.add(result);
+        }
+      });
+      _saveChanges();
+    }
   }
 
   void _deleteQuestion(int index) {
@@ -2115,18 +2244,13 @@ class _ExamQuestionManagerScreenState extends State<ExamQuestionManagerScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text("确认删除"),
-        content: Text("确定要删除题目: ${_questions[index].question.substring(0, math.min(50, _questions[index].question.length))}... 吗？"),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("取消"),
-          ),
+        content: Text("确定要删除此题吗？操作无法撤销。"),
+        actions:[
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
           TextButton(
             onPressed: () {
-              setState(() {
-                _questions.removeAt(index);
-                _saveChanges();
-              });
+              setState(() => _questions.removeAt(index));
+              _saveChanges();
               Navigator.pop(ctx);
             },
             child: const Text("删除", style: TextStyle(color: Colors.red)),
@@ -2138,33 +2262,29 @@ class _ExamQuestionManagerScreenState extends State<ExamQuestionManagerScreen> {
 
   Future<void> _saveChanges() async {
     final updatedExam = SavedExam(
-      id: widget.exam.id,
-      title: widget.exam.title,
+      id: widget.exam.id, title: widget.exam.title,
       examJson: jsonEncode(_questions.map((q) => q.toJson()).toList()),
-      knowledgeBase: widget.exam.knowledgeBase,
-      createdAt: widget.exam.createdAt,
+      knowledgeBase: widget.exam.knowledgeBase, createdAt: widget.exam.createdAt,
     );
     await DatabaseHelper.updateExam(updatedExam);
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 题库已更新")));
-    }
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 题库热更新成功")));
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text("管理题库: ${widget.exam.title}"),
-        actions: [
+        title: Text("题库教研室: ${widget.exam.title}"),
+        actions:[
           IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: "新增题目",
-            onPressed: _addQuestion,
+            icon: const Icon(Icons.add_box), tooltip: "人工录入新题",
+            onPressed: () => _openEditorDialog(),
           ),
+          const SizedBox(width: 8)
         ],
       ),
       body: _questions.isEmpty
-          ? const Center(child: Text("暂无题目，点击右上角添加按钮新增题目"))
+          ? const Center(child: Text("题库已空闲，请通过右上角或重新扫描文档新增题录。"))
           : ListView.builder(
               padding: const EdgeInsets.all(16),
               itemCount: _questions.length,
@@ -2173,35 +2293,233 @@ class _ExamQuestionManagerScreenState extends State<ExamQuestionManagerScreen> {
                 return Card(
                   margin: const EdgeInsets.only(bottom: 12),
                   child: ListTile(
-                    leading: CircleAvatar(
-                      child: Text("${index + 1}"),
-                    ),
+                    leading: CircleAvatar(child: Text("${index + 1}")),
                     title: Text(
-                      question.question.length > 100
-                          ? "${question.question.substring(0, 100)}..."
-                          : question.question,
+                      question.question.replaceAll('\n', ' '),
+                      maxLines: 2, overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
-                    subtitle: Text("题型: ${question.type} | 选项数: ${question.options.length}"),
+                    subtitle: Text("题型: ${question.type} | 答案: ${question.correctAnswer}"),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.edit, color: Colors.blue),
-                          tooltip: "编辑",
-                          onPressed: () => _editQuestion(index),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.delete, color: Colors.red),
-                          tooltip: "删除",
-                          onPressed: () => _deleteQuestion(index),
-                        ),
+                      children:[
+                        IconButton(icon: const Icon(Icons.edit, color: Colors.blue), onPressed: () => _openEditorDialog(initialData: question, editIndex: index)),
+                        IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () => _deleteQuestion(index)),
                       ],
                     ),
                   ),
                 );
               },
             ),
+    );
+  }
+}
+
+// [新增组件] 功能完整的富文本态试题表单引擎
+class QuestionEditorDialog extends StatefulWidget {
+  final ExamQuestion? initialData;
+  const QuestionEditorDialog({super.key, this.initialData});
+
+  @override
+  State<QuestionEditorDialog> createState() => _QuestionEditorDialogState();
+}
+
+class _QuestionEditorDialogState extends State<QuestionEditorDialog> {
+  final _formKey = GlobalKey<FormState>();
+  
+  late String _type;
+  late TextEditingController _questionCtrl;
+  late TextEditingController _correctAnswerCtrl;
+  late TextEditingController _analysisCtrl;
+  late List<TextEditingController> _optionsCtrls;
+  
+  bool _isOptimizing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _type = widget.initialData?.type ?? 'single_choice';
+    _questionCtrl = TextEditingController(text: widget.initialData?.question ?? '');
+    _analysisCtrl = TextEditingController(text: widget.initialData?.analysis ?? '');
+    
+    // 兼容答案类型的格式化
+    dynamic ans = widget.initialData?.correctAnswer;
+    if (ans is List) {
+      _correctAnswerCtrl = TextEditingController(text: ans.join(','));
+    } else {
+      _correctAnswerCtrl = TextEditingController(text: ans?.toString() ?? '');
+    }
+
+    _optionsCtrls = (widget.initialData?.options ?? ['']).map((e) => TextEditingController(text: e)).toList();
+    if (_optionsCtrls.isEmpty) _optionsCtrls.add(TextEditingController());
+  }
+
+  @override
+  void dispose() {
+    _questionCtrl.dispose(); _correctAnswerCtrl.dispose(); _analysisCtrl.dispose();
+    for (var c in _optionsCtrls) { c.dispose(); }
+    super.dispose();
+  }
+
+  void _applyAIModelRefinement() async {
+    if (!_formKey.currentState!.validate()) return;
+    
+    setState(() => _isOptimizing = true);
+    
+    final currentDraft = ExamQuestion(
+      type: _type,
+      question: _questionCtrl.text,
+      options: _optionsCtrls.map((e) => e.text).where((e) => e.isNotEmpty).toList(),
+      correctAnswer: _correctAnswerCtrl.text,
+      analysis: _analysisCtrl.text
+    );
+
+    final optimized = await DualAIService.optimizeQuestion(currentDraft, "请提升这道题的学术规范性和严谨性");
+    
+    setState(() => _isOptimizing = false);
+
+    if (optimized != null) {
+      setState(() {
+        _questionCtrl.text = optimized.question;
+        _analysisCtrl.text = optimized.analysis;
+        // 动态覆盖选项组
+        _optionsCtrls.clear();
+        for (var opt in optimized.options) { _optionsCtrls.add(TextEditingController(text: opt)); }
+        // 适配答案
+        if (optimized.correctAnswer is List) {
+          _correctAnswerCtrl.text = optimized.correctAnswer.join(',');
+        } else {
+          _correctAnswerCtrl.text = optimized.correctAnswer.toString();
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ AI 教研模型润色完成")));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ 润色失败，请检查模型网关连通性")));
+    }
+  }
+
+  void _save() {
+    if (_formKey.currentState!.validate()) {
+      dynamic finalAns = _correctAnswerCtrl.text.trim();
+      if (_type == 'multi_choice') {
+        finalAns = finalAns.toString().split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+      }
+      final result = ExamQuestion(
+        type: _type,
+        question: _questionCtrl.text.trim(),
+        options: _optionsCtrls.map((c) => c.text.trim()).where((e) => e.isNotEmpty).toList(),
+        correctAnswer: finalAns,
+        analysis: _analysisCtrl.text.trim(),
+      );
+      Navigator.pop(context, result);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    bool hasOptions =['single_choice', 'multi_choice'].contains(_type);
+
+    return AlertDialog(
+      title: Row(
+        children:[
+          const Text("题目设计控制台"),
+          const Spacer(),
+          // 一键大模型联动按钮
+          FilledButton.tonalIcon(
+            icon: _isOptimizing ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.auto_awesome),
+            label: const Text("AI 教研润色"),
+            onPressed: _isOptimizing ? null : _applyAIModelRefinement,
+          )
+        ],
+      ),
+      content: SizedBox(
+        width: 800, 
+        child: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children:[
+                DropdownButtonFormField<String>(
+                  value: _type,
+                  decoration: const InputDecoration(labelText: "业务流题型", border: OutlineInputBorder()),
+                  items: const[
+                    DropdownMenuItem(value: 'single_choice', child: Text("单选题")),
+                    DropdownMenuItem(value: 'multi_choice', child: Text("多选题")),
+                    DropdownMenuItem(value: 'fill_blank', child: Text("填空题")),
+                    DropdownMenuItem(value: 'essay', child: Text("简答论述题")),
+                  ],
+                  onChanged: (v) => setState(() => _type = v!),
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: _questionCtrl, maxLines: 4, minLines: 2,
+                  decoration: const InputDecoration(labelText: "题干详情 (支持 Markdown & LaTeX)", border: OutlineInputBorder()),
+                  validator: (v) => v!.isEmpty ? '题干不可为空' : null,
+                ),
+                const SizedBox(height: 16),
+                
+                if (hasOptions) ...[
+                  const Text("分支选项 (选项流):", style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  ..._optionsCtrls.asMap().entries.map((entry) {
+                    int idx = entry.key;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8.0),
+                      child: Row(
+                        children:[
+                          Expanded(
+                            child: TextFormField(
+                              controller: _optionsCtrls[idx],
+                              decoration: InputDecoration(labelText: "选项标识 (例如 A. 内容)", border: const OutlineInputBorder(), isDense: true),
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.remove_circle_outline, color: Colors.red),
+                            onPressed: () => setState(() {
+                              if (_optionsCtrls.length > 1) {
+                                _optionsCtrls[idx].dispose();
+                                _optionsCtrls.removeAt(idx);
+                              }
+                            }),
+                          )
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                  TextButton.icon(
+                    icon: const Icon(Icons.add), label: const Text("追加扰乱项"),
+                    onPressed: () => setState(() => _optionsCtrls.add(TextEditingController())),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+
+                TextFormField(
+                  controller: _correctAnswerCtrl,
+                  decoration: InputDecoration(
+                    labelText: _type == 'multi_choice' ? "标定锚点（多个请用英文逗号隔开）" : "标准采分点", 
+                    border: const OutlineInputBorder()
+                  ),
+                  validator: (v) => v!.isEmpty ? '答案标准链不可缺失' : null,
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: _analysisCtrl, maxLines: 5, minLines: 2,
+                  decoration: const InputDecoration(labelText: "教研解析", border: OutlineInputBorder()),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions:[
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text("终止放弃")),
+        FilledButton.icon(
+          icon: const Icon(Icons.check), label: const Text("编译存档"),
+          onPressed: _isOptimizing ? null : _save,
+        ),
+      ],
     );
   }
 }
@@ -2313,7 +2631,6 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   double _saveProgress = 0.0;
 
   bool _enableOCR = true;
-  final String _ocrModel = "vision-model";
   bool _useNativePDF = true;
 
   final List<String> _logLines = ["[INFO] 系统已就绪，等待交互..."];
@@ -2394,23 +2711,43 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     }
   }
 
+  // [修改] 特性 1 & 4: 底层文本解码与 Word 文档解析 (KnowledgeInputScreen 中)
   Future<String> _parseWordDocument(String filePath, String ext) async {
     try {
+      // [核心修复] 对抗 Linux 终端环境下的路径空格和特殊符号截断
+      final escapedPath = filePath.replaceAll("'", "'\\''");
+
       if (ext == '.docx') {
-        // 利用 unzip 与 sed 高速剥离 XML (无需依赖额外的 Office 套件)
-        final res = await io.Process.run('sh', ['-c', 'unzip -p "$filePath" word/document.xml | sed -e "s/<[^>]*>//g"']);
+        final res = await io.Process.run('sh',['-c', "unzip -p '$escapedPath' word/document.xml | sed -e 's/<[^>]*>//g'"]);
         if (res.exitCode == 0) return res.stdout.toString();
         throw Exception(res.stderr.toString());
       } else if (ext == '.doc') {
-        // 针对遗留 doc 格式，依赖轻量的 antiword (Debian: sudo apt install antiword)
-        final res = await io.Process.run('antiword', [filePath]);
-        if (res.exitCode == 0) return res.stdout.toString();
-        throw Exception("需要 antiword 依赖，请在终端执行: sudo apt-get install antiword");
+        // 策略1：使用轻量级 catdoc (成功率高且对中文友好)
+        var res = await io.Process.run('catdoc', [filePath]);
+        if (res.exitCode == 0 && res.stdout.toString().trim().isNotEmpty) return res.stdout.toString();
+        
+        // 策略2：使用 antiword
+        res = await io.Process.run('antiword', [filePath]);
+        if (res.exitCode == 0 && res.stdout.toString().trim().isNotEmpty) return res.stdout.toString();
+
+        // 策略3：降级使用 libreoffice 隐式转换引擎
+        final tempDir = await io.Directory.systemTemp.createTemp('doc_convert_');
+        res = await io.Process.run('libreoffice',['--headless', '--convert-to', 'txt:Text', '--outdir', tempDir.path, filePath]);
+        if (res.exitCode == 0) {
+            final outName = "${path.basenameWithoutExtension(filePath)}.txt";
+            final outFile = io.File(path.join(tempDir.path, outName));
+            if (await outFile.exists()) {
+                final content = await outFile.readAsString();
+                await tempDir.delete(recursive: true);
+                return content;
+            }
+        }
+        throw Exception("Debian 系统需要依赖处理过时的 doc，请在终端执行: sudo apt install catdoc");
       }
       return "";
     } catch (e) {
       AppLogger.log("❌ Word 文件解析异常 ($ext): $e", isError: true);
-      return "\n[Word 解析失败: $e]";
+      return "\n[Word 解析失败: $e (建议在原环境将其另存为 PDF/TXT后再试)]";
     }
   }
 
@@ -2611,11 +2948,10 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
 
       // [新增逻辑] 覆写向量索引
       final embeddingModel = await ConfigService.getEmbeddingModel();
-      final lmUrl = await ConfigService.getLmStudioUrl();
       if (embeddingModel.isNotEmpty) {
         AppLogger.log("触发数据库热更新，正在重建 Embedding 向量树...");
         await SemanticRetrievalService.buildAndSaveIndex(
-          updatedExam.id!, finalText, embeddingModel, lmUrl,
+          updatedExam.id!, finalText,
           onProgress: (status, progress) {
             if (mounted) {
               setState(() {
@@ -2878,6 +3214,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   }
 }
 
+// ==========================================
+// 视图层 - 配置与设置界面 (全矩阵动态渲染版)
+// ==========================================
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
   @override
@@ -2885,89 +3224,168 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  final TextEditingController _dsKeyController = TextEditingController();
-  final TextEditingController _lmUrlController = TextEditingController();
-  final TextEditingController _chatModelController = TextEditingController();
-  final TextEditingController _visionModelController = TextEditingController();
-  final TextEditingController _rerankModelController = TextEditingController();
-  final TextEditingController _embeddingModelController = TextEditingController();
-  bool _enableRerank = false;
+  // 定义四大算子引擎基座
+  final List<Map<String, String>> _taskTypes =[
+    {"id": "chat", "name": "核心推理流 (出题/评卷/诊断)"},
+    {"id": "vision", "name": "视觉多模态流 (OCR图文解析)"},
+    {"id": "embedding", "name": "语义降维流 (向量化/Embedding)"},
+    {"id": "rerank", "name": "特征强化流 (知识 Rerank 重排序)"},
+  ];
 
-  @override void initState() { super.initState(); _loadConfig(); }
-  
-  Future<void> _loadConfig() async {
-    _dsKeyController.text = await ConfigService.getDeepSeekKey();
-    _lmUrlController.text = await ConfigService.getLmStudioUrl();
-    _chatModelController.text = await ConfigService.getChatModel();
-    _visionModelController.text = await ConfigService.getVisionModel();
-    _rerankModelController.text = await ConfigService.getRerankModel();
-    _embeddingModelController.text = await ConfigService.getEmbeddingModel();
+  // 状态维护矩阵
+  Map<String, String> _configs = {};
+  final Map<String, TextEditingController> _controllers = {};
+  bool _enableRerank = false;
+  bool _isLoading = true;
+
+  @override 
+  void initState() { 
+    super.initState(); 
+    _loadAllConfigs(); 
+  }
+
+  @override
+  void dispose() {
+    _controllers.values.forEach((c) => c.dispose());
+    super.dispose();
+  }
+
+  Future<void> _loadAllConfigs() async {
     _enableRerank = await ConfigService.getEnableRerank();
-    setState(() {});
+    
+    for (var task in _taskTypes) {
+      String t = task['id']!;
+      _configs['${t}_engine'] = await ConfigService.getConfigString('${t}_engine', 'cloud');
+      
+      for (String env in ['cloud', 'local']) {
+        for (String field in['url', 'key', 'model']) {
+          String mapKey = '${t}_${env}_$field';
+          String val = await ConfigService.getConfigString(mapKey, '');
+          _configs[mapKey] = val;
+          _controllers[mapKey] = TextEditingController(text: val);
+        }
+      }
+    }
+    setState(() => _isLoading = false);
   }
   
-  Future<void> _saveConfig() async {
-    await ConfigService.saveDeepSeekKey(_dsKeyController.text.trim());
-    await ConfigService.saveLmStudioUrl(_lmUrlController.text.trim());
-    await ConfigService.saveChatModel(_chatModelController.text.trim());
-    await ConfigService.saveVisionModel(_visionModelController.text.trim());
-    await ConfigService.saveRerankModel(_rerankModelController.text.trim());
-    await ConfigService.saveEmbeddingModel(_embeddingModelController.text.trim());
+  Future<void> _saveAllConfigs() async {
     await ConfigService.setEnableRerank(_enableRerank);
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 参数已持久化并生效")));
+    
+    for (var task in _taskTypes) {
+      String t = task['id']!;
+      await ConfigService.setConfigString('${t}_engine', _configs['${t}_engine']!);
+      
+      for (String env in ['cloud', 'local']) {
+        for (String field in ['url', 'key', 'model']) {
+          String mapKey = '${t}_${env}_$field';
+          await ConfigService.setConfigString(mapKey, _controllers[mapKey]!.text.trim());
+        }
+      }
+    }
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 拓扑路由矩阵已持久化存储并生效")));
+  }
+
+  Widget _buildTaskSection(Map<String, String> task) {
+    String t = task['id']!;
+    String currentEngine = _configs['${t}_engine'] ?? 'cloud';
+
+    return Card(
+      elevation: 2, margin: const EdgeInsets.only(bottom: 24),
+      child: ExpansionTile(
+        initiallyExpanded: t == 'chat',
+        title: Text(task['name']!, style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text("当前路由节点: ${currentEngine == 'cloud' ? '☁️ 云端外部 API' : '💻 本地私有化节点'}"),
+        children:[
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children:[
+                if (t == 'rerank') ...[
+                  SwitchListTile(
+                    title: const Text("主开关：全局启用 Rerank 机制提升特征命中率", style: TextStyle(color: Colors.indigo, fontWeight: FontWeight.bold)),
+                    value: _enableRerank,
+                    onChanged: (v) => setState(() => _enableRerank = v),
+                  ),
+                  const Divider(),
+                ],
+                
+                Row(
+                  children:[
+                    const Text("业务节点切换："),
+                    Radio<String>(value: "cloud", groupValue: currentEngine, onChanged: (v) => setState(() => _configs['${t}_engine'] = v!)),
+                    const Text("☁️ 云端接口"),
+                    const SizedBox(width: 16),
+                    Radio<String>(value: "local", groupValue: currentEngine, onChanged: (v) => setState(() => _configs['${t}_engine'] = v!)),
+                    const Text("💻 本地接口 (LM-Studio等)"),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceVariant, borderRadius: BorderRadius.circular(8), border: Border.all(color: currentEngine == 'cloud' ? Colors.blue.withOpacity(0.5) : Colors.transparent)),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children:[
+                      const Text("☁️ 云端参数映射", style: TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 12),
+                      TextField(controller: _controllers['${t}_cloud_url'], decoration: const InputDecoration(labelText: "API Base URL (例: https://api.deepseek.com/v1)", border: OutlineInputBorder(), isDense: true)),
+                      const SizedBox(height: 12),
+                      TextField(controller: _controllers['${t}_cloud_key'], obscureText: true, decoration: const InputDecoration(labelText: "API Key (Bearer Token)", border: OutlineInputBorder(), isDense: true)),
+                      const SizedBox(height: 12),
+                      TextField(controller: _controllers['${t}_cloud_model'], decoration: const InputDecoration(labelText: "模型标识 (Model ID)", border: OutlineInputBorder(), isDense: true)),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceVariant, borderRadius: BorderRadius.circular(8), border: Border.all(color: currentEngine == 'local' ? Colors.green.withOpacity(0.5) : Colors.transparent)),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children:[
+                      const Text("💻 本地私有化参数映射", style: TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 12),
+                      TextField(controller: _controllers['${t}_local_url'], decoration: const InputDecoration(labelText: "LM-Studio / Ollama Base URL", border: OutlineInputBorder(), isDense: true)),
+                      const SizedBox(height: 12),
+                      TextField(controller: _controllers['${t}_local_key'], decoration: const InputDecoration(labelText: "预留 API Key (通常填 lm-studio 即可)", border: OutlineInputBorder(), isDense: true)),
+                      const SizedBox(height: 12),
+                      TextField(controller: _controllers['${t}_local_model'], decoration: const InputDecoration(labelText: "挂载模型标识 (Model ID)", border: OutlineInputBorder(), isDense: true)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          )
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+
     return Scaffold(
-      appBar: AppBar(title: const Text("引擎参数与模型映射配置")),
+      appBar: AppBar(title: const Text("多维网关矩阵映射与控制中心")),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24), 
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children:[
-            const Text("云端验证大模型", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 12),
-            TextField(controller: _dsKeyController, obscureText: true, decoration: const InputDecoration(labelText: "DeepSeek API Key", border: OutlineInputBorder())),
+            const Text("每一个独立引擎均支持在本地私有算力与外部云端 API 之间自由切换，实现架构层解耦。", style: TextStyle(color: Colors.grey, fontSize: 13)),
+            const SizedBox(height: 24),
             
-            const Padding(padding: EdgeInsets.symmetric(vertical: 24), child: Divider()),
+            ..._taskTypes.map((t) => _buildTaskSection(t)).toList(),
             
-            const Text("本地 LM-Studio 后端绑定", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 8),
-            const Text("若返回 400 错误，请确保下方填写的模型标识符与 LM-Studio 中加载的完全一致（例如: qwen/qwen3.5-2b 或 qwen-vl-reranker-2b）。", style: TextStyle(color: Colors.redAccent, fontSize: 13)),
-            const SizedBox(height: 16),
-            
-            TextField(controller: _lmUrlController, decoration: const InputDecoration(labelText: "LM-Studio 基础 URL", border: OutlineInputBorder())),
-            const SizedBox(height: 16),
-            TextField(controller: _chatModelController, decoration: const InputDecoration(labelText: "文本提炼模型标识 (Chat Model ID)", hintText: "qwen/qwen3.5-2b", border: OutlineInputBorder())),
-            const SizedBox(height: 16),
-            TextField(controller: _visionModelController, decoration: const InputDecoration(labelText: "视觉解析模型标识 (Vision Model ID)", hintText: "qwen-vl-chat", border: OutlineInputBorder())),
-            const SizedBox(height: 16),
-            TextField(controller: _rerankModelController, decoration: const InputDecoration(labelText: "重排序模型标识 (Rerank Model ID)", hintText: "qwen-vl-reranker-2b", border: OutlineInputBorder())),
-            const SizedBox(height: 16),
-            TextField(controller: _embeddingModelController, decoration: const InputDecoration(labelText: "嵌入模型标识 (Embedding Model ID)", hintText: "mxbai-embed-large", border: OutlineInputBorder())),
-            
-            const SizedBox(height: 16),
-            // 添加rerank功能开关
-            Row(
-              children: [
-                Switch(
-                  value: _enableRerank,
-                  onChanged: (value) {
-                    setState(() {
-                      _enableRerank = value;
-                    });
-                  },
-                ),
-                const Text("启用重排序功能", style: TextStyle(fontSize: 16)),
-              ],
-            ),
-            
-            const SizedBox(height: 32),
+            const SizedBox(height: 24),
             SizedBox(
-              width: double.infinity, height: 50,
-              child: FilledButton(onPressed: _saveConfig, child: const Text("保存并应用")),
+              width: double.infinity, height: 60,
+              child: FilledButton.icon(icon: const Icon(Icons.save), label: const Text("校验并存储拓扑矩阵", style: TextStyle(fontSize: 16)), onPressed: _saveAllConfigs),
             ),
+            const SizedBox(height: 48),
         ]),
       ),
     );
@@ -2998,7 +3416,6 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
 
   // --- 多模态模型选项配置 ---
   bool _enableOCR = true;
-  final String _ocrModel = "vision-model";
   bool _useNativePDF = true;
 
   @override
