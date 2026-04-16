@@ -1128,6 +1128,7 @@ class DualAIService {
 1. 题量：$count 道。难度：$difficulty。
 2. 题型分布：必须包含单选、多选、填空、应用题。
 3. 【用户自定义出题指令】：${customPrompt.isNotEmpty ? customPrompt : '无特殊指令，请全面考察核心概念'}
+4. 需要具备一定的难度，贴近实际生活和考试要求，避免过于简单或过于学术化的题目。
 【原始上下文】：\n$contextText
 必须以严格 JSON 格式返回：{"questions":[{"type": "single_choice", "question": "题干", "options":["A", "B", "C", "D"], "correct_answer": "正确答案", "analysis": "详细解析"}]}""";
 
