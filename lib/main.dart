@@ -474,11 +474,20 @@ class _ChatWithKnowledgeScreenState extends State<ChatWithKnowledgeScreen> {
 String _preprocessLatex(String text) {
   if (text.isEmpty) return "正在检索知识库...";
   // 标准化 LaTeX 块级与行内符号边界
-  return text
+  String result = text
       .replaceAll(r'\[', r'$$')
       .replaceAll(r'\]', r'$$')
       .replaceAll(r'\(', r'$')
       .replaceAll(r'\)', r'$');
+  // 如果文本中已经包含 $...$ 格式的 LaTeX，直接返回
+  if (result.contains(r'$')) return result;
+  // 检测纯文本中的数学表达式模式，自动包裹 $...$
+  // 匹配 x^2, x^3, a^b, x_{1}, x_1, sqrt, frac 等常见数学表达式
+  result = result.replaceAllMapped(
+    RegExp(r'(?<!\$)([a-zA-Z]+\^[a-zA-Z0-9{}]+|[a-zA-Z]_\{[a-zA-Z0-9]+\}|[a-zA-Z]_\w+)(?!\$)'),
+    (match) => '\$${match.group(0)}\$',
+  );
+  return result;
 }
 
 Widget _renderMarkdown(String content, {bool isSelectable = false, bool shrinkWrap = true}) {
@@ -487,6 +496,9 @@ Widget _renderMarkdown(String content, {bool isSelectable = false, bool shrinkWr
     data: processedContent,
     selectable: isSelectable,
     shrinkWrap: shrinkWrap,
+    styleSheet: MarkdownStyleSheet(
+      p: const TextStyle(fontWeight: FontWeight.w400, fontSize: 16.0),
+    ),
     builders: {
       'latex': LatexElementBuilder(
         textStyle: const TextStyle(fontWeight: FontWeight.w400, fontSize: 16.0),
@@ -1096,7 +1108,7 @@ class DualAIService {
           "messages":[
             {"role": "system", "content": "你是一个学术助教。请从庞杂的用户数据中，提取出最具考察价值的知识点。"},
             {"role": "user", "content": "请基于以下文本，列出 $count 个适合作为考试题目的知识点：\n\n文本：$processedContext"}
-          ],
+         ],
           "temperature": 0.3,
         },
       );
@@ -1126,9 +1138,10 @@ class DualAIService {
     final prompt = """你是一个资深的学科出题专家。请基于以下提供的【知识库检索上下文】，针对主题【$topic】，生成一份高质量的混合题型试卷。
 出题严格要求：
 1. 题量：$count 道。难度：$difficulty。
-2. 题型分布：必须包含单选、多选、填空、应用题。
-3. 【用户自定义出题指令】：${customPrompt.isNotEmpty ? customPrompt : '无特殊指令，请全面考察核心概念'}
+2. 题型分布：必须包含单选、多选、填空、应用题（按照难度选择题型）。
+3. 【用户自定义出题指令】：${customPrompt.isNotEmpty ? customPrompt : ''}
 4. 需要具备一定的难度，贴近实际生活和考试要求，避免过于简单或过于学术化的题目。
+5. 难度参考期末考试试卷难度。
 【原始上下文】：\n$contextText
 必须以严格 JSON 格式返回：{"questions":[{"type": "single_choice", "question": "题干", "options":["A", "B", "C", "D"], "correct_answer": "正确答案", "analysis": "详细解析"}]}""";
 
@@ -1181,7 +1194,7 @@ class DualAIService {
           ),
           data: {
             "model": engineCtx["model"], 
-            "messages":[{"role": "user", "content":[{"type": "text", "text": "提取图片中的所有文本信息,但是也请描述图片内容,特别是示意图,请直接输出信息。"},{"type": "image_url", "image_url": {"url": "data:$mimeType;base64,$base64Img"}}]}]
+            "messages":[{"role": "user", "content":[{"type": "text", "text": "提取图片中的所有文本信息,但是也请描述图片内容,特别是示意图，如果遇到表格，请输出表格内容,请直接输出信息，不需要包含过多的格式。"},{"type": "image_url", "image_url": {"url": "data:$mimeType;base64,$base64Img"}}]}]
           },
         );
         if (response.statusCode != 200) throw Exception("HTTP ${response.statusCode}: ${response.data}");
@@ -1595,37 +1608,40 @@ class ExamProvider extends ChangeNotifier {
 
   // [终极修复] 通过无限存储 + 动态精准切片组装，彻底规避 400 崩溃
   Future<bool> processAndGenerate({
-    required String rawText, required String topic, required int count, required String difficulty, String customPrompt = ""
+    required String rawText, required String topic, required int count, required String difficulty, String customPrompt = "",
+    bool useEmbedding = true,  // [新增] 是否使用向量化检索
   }) async {
     _isLoading = true;
     _errorMessage = "";
     _updateProgress("引擎启动中...", 0.0);
 
-    try {
-      if ((await ConfigService.getCloudApiKey()).isEmpty) throw Exception("请先在设置中配置云端 API Key");
-      
-      final embeddingModel = await ConfigService.getEmbeddingModel();
-      if (embeddingModel.isEmpty) {
-        throw Exception("🚨 为了保障超长文本处理的绝对稳定，必须前置配置 Embedding 模型进行向量化！请前往设置填写。");
-      }
+      try {
+        if ((await ConfigService.getCloudApiKey()).isEmpty) throw Exception("请先在设置中配置云端 API Key");
 
-      _updateProgress("正在将海量原始知识库全量持久化...", 0.02);
-      final provisionalExam = SavedExam(title: topic, examJson: "[]", knowledgeBase: rawText, createdAt: DateTime.now().millisecondsSinceEpoch);
-      int currentExamId = await DatabaseHelper.saveExam(provisionalExam);
+        _updateProgress("正在将海量原始知识库全量持久化...", 0.02);
+        final provisionalExam = SavedExam(title: topic, examJson: "[]", knowledgeBase: rawText, createdAt: DateTime.now().millisecondsSinceEpoch);
+        int currentExamId = await DatabaseHelper.saveExam(provisionalExam);
 
-      // 1. 无限切片并建立向量树索引：不受文本总长度限制，依靠 SQLite 处理海量切块
-      _updateProgress("正在进行文本碎片化与向量树重构...", 0.10);
-      await SemanticRetrievalService.buildAndSaveIndex(currentExamId, rawText, onProgress: _updateProgress);
+        // 1. 根据 useEmbedding 参数决定是否执行向量化检索
+        String processedText = rawText;
+        if (useEmbedding) {
+          final embeddingModel = await ConfigService.getEmbeddingModel();
+          if (embeddingModel.isNotEmpty) {
+            _updateProgress("正在进行文本碎片化与向量树重构...", 0.10);
+            await SemanticRetrievalService.buildAndSaveIndex(currentExamId, rawText, onProgress: _updateProgress);
 
-      // 2. 动态精准拼装上下文：利用主题词提取 Top-5 知识域切片 (数学期望字数 < 3000)，完美兼容 4096 Tokens 限制
-      _updateProgress("正在从向量库提取 '$topic' 的高维特征片段...", 0.90);
-      final chunks = await SemanticRetrievalService.searchContext(currentExamId, topic);
-      String processedText = chunks.join("\n\n");
-      
-      // Fallback: 兜底保护
-      if (processedText.isEmpty) {
-        throw Exception("未能从数据库中提取到有效切片，请检查向量模型是否工作正常。");
-      }
+            // 2. 动态精准拼装上下文：利用主题词提取 Top-5 知识域切片
+            _updateProgress("正在从向量库提取 '$topic' 的高维特征片段...", 0.90);
+            final chunks = await SemanticRetrievalService.searchContext(currentExamId, topic);
+            if (chunks.isNotEmpty) {
+              processedText = chunks.join("\n\n");
+            }
+          } else {
+            _updateProgress("未配置 Embedding 模型，跳过向量化，直接使用原始文本出题...", 0.50);
+          }
+        } else {
+          _updateProgress("用户选择跳过向量化，直接使用原始文本出题...", 0.50);
+        }
 
       // 3. 执行安全的本地 Rerank
       final enableRerank = await ConfigService.getEnableRerank();
@@ -1844,7 +1860,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               ).then((_) => _loadHistory());
                             }
                           ),
-                          // 原有：重新从原知识库生成试卷
+                          // 重新从原知识库生成试卷（弹出配置对话框）
                           IconButton(
                             icon: const Icon(Icons.refresh, color: Colors.blue), 
                             tooltip: "从原知识库生成新考题", 
@@ -1853,10 +1869,21 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库为旧版本生成，无原始知识库缓存。")));
                                 return;
                               }
-                              context.read<ExamProvider>().processAndGenerate(
-                                rawText: item.knowledgeBase, topic: item.title, count: item.parsedQuestions.length, difficulty: "中等"
-                              ).then((_) => _loadHistory());
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在后台洗牌生成新考题...")));
+                              showDialog(
+                                context: context,
+                                builder: (ctx) => _RegenerateExamDialog(
+                                  exam: item,
+                                  onStart: (topic, count, difficulty, useEmbedding) async {
+                                    Navigator.pop(ctx);
+                                    final provider = context.read<ExamProvider>();
+                                    await provider.processAndGenerate(
+                                      rawText: item.knowledgeBase, topic: topic, count: count, difficulty: difficulty,
+                                      useEmbedding: useEmbedding,
+                                    );
+                                    _loadHistory();
+                                  },
+                                ),
+                              );
                             }
                           ),
                           // [新增] 本地知识库 Q&A 对话功能
@@ -1874,6 +1901,27 @@ class _HomeScreenState extends State<HomeScreen> {
                               );
                             }
                           ),
+                          // [新增] 手动构建向量索引
+                          IconButton(
+                            icon: const Icon(Icons.storage, color: Colors.orange),
+                            tooltip: "手动构建向量索引",
+                            onPressed: () async {
+                              if (item.knowledgeBase.isEmpty) {
+                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库无原始知识库，无法构建向量索引。")));
+                                return;
+                              }
+                              final embeddingModel = await ConfigService.getEmbeddingModel();
+                              if (embeddingModel.isEmpty) {
+                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("未配置 Embedding 模型，请先前往设置页配置。")));
+                                return;
+                              }
+                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在构建向量索引，请稍候...")));
+                              await SemanticRetrievalService.buildAndSaveIndex(item.id!, item.knowledgeBase);
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 向量索引构建完成")));
+                              }
+                            }
+                          ),
                           // [新增] 题库管理功能
                           IconButton(
                             icon: const Icon(Icons.list_alt, color: Colors.teal),
@@ -1883,6 +1931,18 @@ class _HomeScreenState extends State<HomeScreen> {
                                 context,
                                 MaterialPageRoute(builder: (_) => ExamQuestionManagerScreen(exam: item))
                               );
+                            }
+                          ),
+                          // [新增] 查询提取底层向量片段
+                          IconButton(
+                            icon: const Icon(Icons.manage_search, color: Colors.deepPurple),
+                            tooltip: "查询提取底层向量片段",
+                            onPressed: () {
+                              if (item.knowledgeBase.isEmpty) {
+                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库无原始知识库数据，无法查询。")));
+                                return;
+                              }
+                              showDialog(context: context, builder: (_) => VectorSearchDialog(exam: item));
                             }
                           ),
                           IconButton(icon: const Icon(Icons.history), tooltip: "查看历史记录", onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamHistoryScreen(exam: item)))),
@@ -1942,6 +2002,14 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
             Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const ExamResultScreen()));
           });
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+
+        // [修复] 空题库保护，防止 questions 为空时访问越界
+        if (provider.questions.isEmpty) {
+          return Scaffold(
+            appBar: AppBar(title: Text("正在答题：${widget.exam.title}")),
+            body: const Center(child: Text("当前题库为空，无法开始答题。")),
+          );
         }
 
         final q = provider.questions[provider.currentIndex];
@@ -2041,10 +2109,15 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
   }
 
   Widget _buildInputWidget(ExamQuestion q, dynamic currentAns, ExamTakingProvider provider) {
+    // 为 RadioListTile 和 CheckboxListTile 提供统一的 LaTeX 渲染选项组件
+    Widget _buildLatexOption(String opt) {
+      return _renderMarkdown(opt, shrinkWrap: true);
+    }
+
     if (q.type == 'single_choice') {
       return Column(
         children: q.options.map((opt) => RadioListTile<String>(
-          title: _renderMarkdown(opt, shrinkWrap: true), // 注入 Latex 渲染
+          title: _buildLatexOption(opt),
           value: opt,
           groupValue: currentAns as String?,
           onChanged: (v) => provider.setAnswer(v),
@@ -2054,7 +2127,7 @@ class _ExamTakingScreenState extends State<ExamTakingScreen> {
       List<String> selections = currentAns != null ? List<String>.from(currentAns) :[];
       return Column(
         children: q.options.map((opt) => CheckboxListTile(
-          title: _renderMarkdown(opt, shrinkWrap: true), // 注入 Latex 渲染
+          title: _buildLatexOption(opt),
           value: selections.contains(opt),
           onChanged: (checked) {
             if (checked == true) selections.add(opt); else selections.remove(opt);
@@ -2329,6 +2402,7 @@ class _QuestionEditorDialogState extends State<QuestionEditorDialog> {
   final _formKey = GlobalKey<FormState>();
   
   late String _type;
+  late List<String> _allowedTypes; // [新增] 动态题型列表
   late TextEditingController _questionCtrl;
   late TextEditingController _correctAnswerCtrl;
   late TextEditingController _analysisCtrl;
@@ -2339,7 +2413,13 @@ class _QuestionEditorDialogState extends State<QuestionEditorDialog> {
   @override
   void initState() {
     super.initState();
+    // [修改点] 引入动态校验
+    _allowedTypes =['single_choice', 'multi_choice', 'fill_blank', 'essay'];
     _type = widget.initialData?.type ?? 'single_choice';
+    if (!_allowedTypes.contains(_type)) {
+      _allowedTypes.add(_type); // 如果大模型犯蠢生成了未知题型，将其加入列表允许展示
+    }
+    
     _questionCtrl = TextEditingController(text: widget.initialData?.question ?? '');
     _analysisCtrl = TextEditingController(text: widget.initialData?.analysis ?? '');
     
@@ -2445,12 +2525,17 @@ class _QuestionEditorDialogState extends State<QuestionEditorDialog> {
                 DropdownButtonFormField<String>(
                   value: _type,
                   decoration: const InputDecoration(labelText: "业务流题型", border: OutlineInputBorder()),
-                  items: const[
-                    DropdownMenuItem(value: 'single_choice', child: Text("单选题")),
-                    DropdownMenuItem(value: 'multi_choice', child: Text("多选题")),
-                    DropdownMenuItem(value: 'fill_blank', child: Text("填空题")),
-                    DropdownMenuItem(value: 'essay', child: Text("简答论述题")),
-                  ],
+                  items: _allowedTypes.map((t) {
+                    String label;
+                    switch (t) {
+                      case 'single_choice': label = "单选题"; break;
+                      case 'multi_choice': label = "多选题"; break;
+                      case 'fill_blank': label = "填空题"; break;
+                      case 'essay': label = "简答论述题"; break;
+                      default: label = "⚠️ 未知题型异常 ($t) - 请修改此项"; break;
+                    }
+                    return DropdownMenuItem(value: t, child: Text(label));
+                  }).toList(),
                   onChanged: (v) => setState(() => _type = v!),
                 ),
                 const SizedBox(height: 16),
@@ -2617,6 +2702,12 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   final TextEditingController _customPromptController = TextEditingController(); // [新增] 自定义出题指令框
   int _questionCount = 5;
 
+  // --- [修改目标] 全量内存缓冲区，替代 TextField 作为主存储 ---
+  final StringBuffer _knowledgeTextBuffer = StringBuffer(); // 全量文本缓冲区
+  String _previewSummary = ''; // 用于在 TextField 中展示简短摘要
+  final int _maxPreviewChars = 5000; // TextField 最多显示字符数
+  int _totalParsedChars = 0; // 已解析总字符数
+
   // --- 升级的状态机：异步任务队列与游标 ---
   bool _isProcessingQueue = false;
   final List<String> _pendingPaths = []; // 文件路径队列
@@ -2644,10 +2735,12 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   @override
   void initState() {
     super.initState();
-    // [新增] 如果为编辑模式，初始化填充数据
+    // [修改目标] 如果为编辑模式，将已有 knowledgeBase 放入缓冲区
     if (_isEditMode) {
       _topicController.text = widget.existingExam!.title;
-      _textController.text = widget.existingExam!.knowledgeBase;
+      _knowledgeTextBuffer.write(widget.existingExam!.knowledgeBase);
+      _totalParsedChars = _knowledgeTextBuffer.length;
+      _updatePreview(); // 更新预览摘要
       _questionCount = widget.existingExam!.parsedQuestions.length; // 同步当前题量
     }
 
@@ -2675,6 +2768,18 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     _topicController.dispose();
     _textController.dispose();
     super.dispose();
+  }
+
+  // [修改目标] 刷新预览文本
+  void _updatePreview() {
+    String fullText = _knowledgeTextBuffer.toString();
+    if (fullText.length <= _maxPreviewChars) {
+      _previewSummary = fullText;
+    } else {
+      _previewSummary = fullText.substring(0, _maxPreviewChars) +
+          "\n\n... (已省略 ${fullText.length - _maxPreviewChars} 个字符，全部内容已安全存储于后台)";
+    }
+    _textController.text = _previewSummary;
   }
 
   void _scrollToBottom() {
@@ -2777,17 +2882,21 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
               await _parsePdfWithOCR(filePath, _activePage, (page, total, text) async {
                  if (mounted) {
                     setState(() {
-                       final prefix = _textController.text.isEmpty ? "" : "\n";
-                       _textController.text += "$prefix$text";
-                       _activePage = page + 1; // 💥 标记该页彻底成功
+                       _knowledgeTextBuffer.write(text);
+                       _totalParsedChars = _knowledgeTextBuffer.length;
+                       _updatePreview();
+                       _activePage = page + 1;
                     });
                  }
-                 // 每一页成功提取后，可以在这里存档（简化处理）
               });
            } else {
               if (_activePage == 0) {
                   String content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[PDF 模型禁用]";
-                  if (mounted) setState(() => _textController.text += "\n$content");
+                  if (mounted) setState(() {
+                    _knowledgeTextBuffer.write("\n$content");
+                    _totalParsedChars = _knowledgeTextBuffer.length;
+                    _updatePreview();
+                  });
                   _activePage = 1; 
               }
            }
@@ -2804,8 +2913,10 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                
                if (mounted) {
                   setState(() {
-                     final prefix = _textController.text.isEmpty ? "" : "\n\n";
-                     _textController.text += "$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content";
+                     final prefix = _knowledgeTextBuffer.isEmpty ? "" : "\n\n";
+                     _knowledgeTextBuffer.write("$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content");
+                     _totalParsedChars = _knowledgeTextBuffer.length;
+                     _updatePreview();
                   });
                }
                _activePage = 1;
@@ -2923,9 +3034,48 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     }
   }
 
-  // [修改] 提交核心调度枢纽
+  // [修改目标] 仅保存知识库不触发大模型出题，使用缓冲区全量数据
+  void _saveOnly() async {
+    String fullText = _knowledgeTextBuffer.toString();
+    if (_topicController.text.trim().isEmpty || fullText.trim().isEmpty) return;
+
+    setState(() {
+      _isSavingDB = true;
+      _saveProgress = 0.05;
+      _saveStatus = "正在仅存入知识库并构建向量树...";
+    });
+
+    // 1. 创建空题目的存根数据
+    final newExam = SavedExam(
+      title: _topicController.text.trim(),
+      examJson: "[]", // 空试卷
+      knowledgeBase: fullText,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    int examId = await DatabaseHelper.saveExam(newExam);
+
+    // 2. 如果开启了 Embedding 则直接构建向量树
+    final embeddingModel = await ConfigService.getEmbeddingModel();
+    if (embeddingModel.isNotEmpty) {
+      await SemanticRetrievalService.buildAndSaveIndex(
+        examId, fullText,
+        onProgress: (status, progress) {
+          if (mounted) setState(() { _saveStatus = status; _saveProgress = progress; });
+        }
+      );
+    }
+
+    if (mounted) {
+      setState(() => _isSavingDB = false);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 知识库及其向量索引已成功保存")));
+      Navigator.pop(context); // 返回上一页
+    }
+  }
+
+  // [修改目标] 提交核心调度枢纽，使用缓冲区全量数据
   void _submitTask() async {
-    if (_topicController.text.trim().isEmpty || _textController.text.trim().isEmpty) return;
+    String fullText = _knowledgeTextBuffer.toString();
+    if (_topicController.text.trim().isEmpty || fullText.trim().isEmpty) return;
     
     if (_isEditMode) {
       //[修复-问题4] 设置知识库热更新的持久化状态栏
@@ -2935,14 +3085,12 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         _saveStatus = "准备持久化知识库文本更新...";
       });
       
-      String finalText = _textController.text.trim();
-      
       // 触发持久化
       final updatedExam = SavedExam(
         id: widget.existingExam!.id,
         title: _topicController.text.trim(),
         examJson: widget.existingExam!.examJson,
-        knowledgeBase: finalText,
+        knowledgeBase: fullText,
         createdAt: widget.existingExam!.createdAt,
       );
       await DatabaseHelper.updateExam(updatedExam);
@@ -2952,7 +3100,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
       if (embeddingModel.isNotEmpty) {
         AppLogger.log("触发数据库热更新，正在重建 Embedding 向量树...");
         await SemanticRetrievalService.buildAndSaveIndex(
-          updatedExam.id!, finalText,
+          updatedExam.id!, fullText,
           onProgress: (status, progress) {
             if (mounted) {
               setState(() {
@@ -2974,7 +3122,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
       final provider = context.read<ExamProvider>();
       final success = await provider.processAndGenerate(
         topic: _topicController.text.trim(), 
-        rawText: _textController.text.trim(), 
+        rawText: fullText, 
         count: _questionCount, 
         difficulty: "中等",
         customPrompt: _customPromptController.text.trim(), // 传入 UI 中的内容
@@ -3167,7 +3315,8 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                         hintText: _enableOCR 
                           ? "在此粘贴或编辑无限长的文本资料，支持导入纯文本、图片或扫描件PDF。本地系统将自动分块构建向量库..." 
                           : "在此粘贴无限长文本。多模态模型已禁用。",
-                        border: const OutlineInputBorder()
+                        border: const OutlineInputBorder(),
+                        label: Text('总字符数: $_totalParsedChars'),
                       )
                     ),
                     const SizedBox(height: 24),
@@ -3195,15 +3344,76 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       const SizedBox(height: 32),
                     ],
 
-                    SizedBox(
-                      width: double.infinity, height: 50, 
-                      // [修改] 动态变更按钮文案与图标
-                      child: FilledButton.icon(
-                        icon: Icon(_isEditMode ? Icons.save : Icons.auto_awesome), 
-                        label: Text(_isEditMode ? "保存知识库更新" : "双流引擎开始制卷"), 
-                        onPressed: _isProcessingQueue ? null : _submitTask
+                    if (_isEditMode) ...[
+                      // 编辑模式下：保存 + 手动构建向量索引
+                      Row(
+                        children: [
+                          Expanded(
+                            child: SizedBox(
+                              height: 50,
+                              child: FilledButton.icon(
+                                icon: const Icon(Icons.save),
+                                label: const Text("保存知识库更新"),
+                                onPressed: _isProcessingQueue ? null : _submitTask,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: SizedBox(
+                              height: 50,
+                              child: OutlinedButton.icon(
+                                icon: const Icon(Icons.storage),
+                                label: const Text("手动构建向量索引"),
+                                onPressed: _isProcessingQueue ? null : () async {
+                                  final text = _textController.text.trim();
+                                  if (text.isEmpty) {
+                                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("知识库内容为空，无法构建向量索引。")));
+                                    return;
+                                  }
+                                  final embeddingModel = await ConfigService.getEmbeddingModel();
+                                  if (embeddingModel.isEmpty) {
+                                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("未配置 Embedding 模型，请先前往设置页配置。")));
+                                    return;
+                                  }
+                                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在构建向量索引，请稍候...")));
+                                  await SemanticRetrievalService.buildAndSaveIndex(widget.existingExam!.id!, text);
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 向量索引构建完成")));
+                                  }
+                                },
+                              ),
+                            ),
+                          ),
+                        ],
                       )
-                    )
+                    ] else ...[
+                      Row(
+                        children:[
+                          Expanded(
+                            child: SizedBox(
+                              height: 50,
+                              child: OutlinedButton.icon(
+                                icon: const Icon(Icons.save),
+                                label: const Text("仅保存知识库 (不出题)"),
+                                onPressed: _isProcessingQueue ? null : _saveOnly,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: SizedBox(
+                              height: 50,
+                              child: FilledButton.icon(
+                                icon: const Icon(Icons.auto_awesome),
+                                label: const Text("保存知识库并生成题库"),
+                                onPressed: _isProcessingQueue ? null : _submitTask,
+                              ),
+                            ),
+                          ),
+                        ],
+                      )
+                    ]
                   ]
                 ),
               ),
@@ -3389,6 +3599,201 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const SizedBox(height: 48),
         ]),
       ),
+    );
+  }
+}
+
+// ==========================================
+// 重新生成考题配置对话框
+// ==========================================
+class _RegenerateExamDialog extends StatefulWidget {
+  final SavedExam exam;
+  final Function(String topic, int count, String difficulty, bool useEmbedding) onStart;
+  const _RegenerateExamDialog({required this.exam, required this.onStart});
+
+  @override
+  State<_RegenerateExamDialog> createState() => _RegenerateExamDialogState();
+}
+
+class _RegenerateExamDialogState extends State<_RegenerateExamDialog> {
+  late TextEditingController _topicCtrl;
+  late int _count;
+  late String _difficulty;
+  late bool _useEmbedding;
+
+  @override
+  void initState() {
+    super.initState();
+    _topicCtrl = TextEditingController(text: widget.exam.title);
+    _count = widget.exam.parsedQuestions.length;
+    _difficulty = "中等";
+    _useEmbedding = false;
+  }
+
+  @override
+  void dispose() {
+    _topicCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text("重新生成考题配置"),
+      content: SizedBox(
+        width: 400,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: _topicCtrl,
+                decoration: const InputDecoration(labelText: "出题方向", border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 16),
+              DropdownButtonFormField<int>(
+                value: _count,
+                decoration: const InputDecoration(labelText: "出题个数", border: OutlineInputBorder()),
+                items: [3, 5, 10, 15, 20].map((e) => DropdownMenuItem(value: e, child: Text("$e 题"))).toList(),
+                onChanged: (v) => setState(() => _count = v!),
+              ),
+              const SizedBox(height: 16),
+              DropdownButtonFormField<String>(
+                value: _difficulty,
+                decoration: const InputDecoration(labelText: "出题难度", border: OutlineInputBorder()),
+                items: const [
+                  DropdownMenuItem(value: "简单", child: Text("简单")),
+                  DropdownMenuItem(value: "中等", child: Text("中等")),
+                  DropdownMenuItem(value: "困难", child: Text("困难")),
+                ],
+                onChanged: (v) => setState(() => _difficulty = v!),
+              ),
+              const SizedBox(height: 16),
+              SwitchListTile(
+                title: const Text("使用向量化检索"),
+                subtitle: const Text("开启后将基于 Embedding 模型从知识库中提取最相关片段出题"),
+                value: _useEmbedding,
+                onChanged: (v) => setState(() => _useEmbedding = v),
+                contentPadding: EdgeInsets.zero,
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text("取消")),
+        FilledButton(
+          onPressed: () {
+            widget.onStart(_topicCtrl.text.trim(), _count, _difficulty, _useEmbedding);
+          },
+          child: const Text("开始生成"),
+        ),
+      ],
+    );
+  }
+}
+
+// ==========================================
+// [新增] 附加视图层 - 向量搜索与数据提取器
+// ==========================================
+class VectorSearchDialog extends StatefulWidget {
+  final SavedExam exam;
+  const VectorSearchDialog({super.key, required this.exam});
+
+  @override
+  State<VectorSearchDialog> createState() => _VectorSearchDialogState();
+}
+
+class _VectorSearchDialogState extends State<VectorSearchDialog> {
+  final TextEditingController _queryCtrl = TextEditingController();
+  bool _isSearching = false;
+  List<String> _results =[];
+
+  void _search() async {
+    if (_queryCtrl.text.trim().isEmpty) return;
+    setState(() { _isSearching = true; _results =[]; });
+    
+    try {
+      final chunks = await SemanticRetrievalService.searchContext(widget.exam.id!, _queryCtrl.text.trim());
+      setState(() => _results = chunks);
+    } catch (e) {
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("检索异常: $e")));
+    } finally {
+      if(mounted) setState(() => _isSearching = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text("知识库底层向量片段提取"),
+      content: SizedBox(
+        width: 600, height: 400,
+        child: Column(
+          children: [
+            Row(
+              children:[
+                Expanded(child: TextField(
+                  controller: _queryCtrl,
+                  decoration: const InputDecoration(hintText: "输入想要提取的数据关键词或意图...", border: OutlineInputBorder()),
+                  onSubmitted: (_) => _search(),
+                )),
+                const SizedBox(width: 8),
+                IconButton(icon: _isSearching ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.search), onPressed: _isSearching ? null : _search)
+              ]
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: _results.isEmpty 
+                ? const Center(child: Text("暂无数据，请输入关键词检索"))
+                : ListView.builder(
+                    itemCount: _results.length,
+                    itemBuilder: (ctx, i) {
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(8.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children:[
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children:[
+                                  Text("片段 ${i+1}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                                  IconButton(
+                                    icon: const Icon(Icons.copy, size: 16),
+                                    onPressed: () {
+                                      Clipboard.setData(ClipboardData(text: _results[i]));
+                                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("该片段已复制到剪贴板")));
+                                    }
+                                  )
+                                ]
+                              ),
+                              const Divider(),
+                              SelectableText(_results[i], style: const TextStyle(fontSize: 12))
+                            ]
+                          )
+                        )
+                      );
+                    }
+                  )
+            )
+          ]
+        )
+      ),
+      actions:[
+        TextButton.icon(
+          icon: const Icon(Icons.copy_all), label: const Text("一键复制全部片段"),
+          onPressed: () {
+            if (_results.isNotEmpty) {
+              Clipboard.setData(ClipboardData(text: _results.join("\n\n")));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("所有相关片段已提取并复制")));
+            }
+          }
+        ),
+        FilledButton(onPressed: () => Navigator.pop(context), child: const Text("关闭"))
+      ]
     );
   }
 }

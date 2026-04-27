@@ -47,7 +47,7 @@ dependencies:
   file_picker: ^8.1.2
   google_mlkit_text_recognition: ^0.15.1
   image_picker: ^1.1.2
-  pdfx: ^2.6.0
+  #pdfx: ^2.6.0
   
   # Markdown and LaTeX rendering
   flutter_markdown_plus: ^1.0.7
