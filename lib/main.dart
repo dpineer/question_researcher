@@ -849,7 +849,11 @@ class ExamRecord {
     }
 
   static Future<Database> _initDB() async {
-    final docDir = io.Directory('${io.Platform.environment['HOME']}/.ai_teacher');
+    // 获取用户主目录：Windows 用 USERPROFILE，其他平台用 HOME
+    final homeDir = io.Platform.environment['HOME'] 
+        ?? io.Platform.environment['USERPROFILE'] 
+        ?? '.';
+    final docDir = io.Directory('$homeDir/.ai_teacher');
     if (!await docDir.exists()) await docDir.create(recursive: true);
     String dbPath = path.join(docDir.path, 'exams_v2.db'); 
     
