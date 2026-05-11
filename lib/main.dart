@@ -584,7 +584,7 @@ class ConfigService {
   static const _storage = FlutterSecureStorage();
   
   static Future<void> _migrateToMatrix() async {
-    final migrated = await DatabaseHelper.getConfig("matrix_migrated_v6");
+    final migrated = await DatabaseHelper.getConfig("matrix_migrated_v7");
     if (migrated == "true") return;
 
     AppLogger.log("正在执行配置降维打击：将全局配置解耦为独立算子矩阵...");
@@ -593,8 +593,8 @@ class ConfigService {
     String globalCloudKey = await DatabaseHelper.getConfig("cloud_api_key") ?? await _storage.read(key: "deepseek_key") ?? "";
     String globalLocalUrl = await DatabaseHelper.getConfig("lm_studio_url") ?? "http://localhost:1234/v1";
 
-    // 循环为四大引擎赋予独立配置副本
-    for (String task in['chat', 'vision', 'rerank', 'embedding']) {
+    // 循环为五大引擎赋予独立配置副本
+    for (String task in['chat', 'vision', 'rerank', 'embedding', 'asr']) {
        await setConfigString('${task}_engine', globalPrimary);
        await setConfigString('${task}_cloud_url', globalCloudUrl);
        await setConfigString('${task}_cloud_key', globalCloudKey);
@@ -611,8 +611,10 @@ class ConfigService {
     await setConfigString('rerank_local_model', await DatabaseHelper.getConfig("lm_rerank_model") ?? "");
     await setConfigString('embedding_cloud_model', await DatabaseHelper.getConfig("cloud_embedding_model") ?? "text-embedding-v1");
     await setConfigString('embedding_local_model', await DatabaseHelper.getConfig("lm_embedding_model") ?? "");
+    await setConfigString('asr_cloud_model', 'whisper-1');
+    await setConfigString('asr_local_model', 'whisper-local');
 
-    await DatabaseHelper.saveConfig("matrix_migrated_v6", "true");
+    await DatabaseHelper.saveConfig("matrix_migrated_v7", "true");
     AppLogger.log("矩阵配置升维完成！");
   }
 
@@ -1031,7 +1033,8 @@ class ExamRecord {
 // 4. 服务层 - 双模型 AI 流水线 (包含埋点与防超时)
 // ==========================================
 class DualAIService {
-  static final Dio _dio = Dio();
+  static final Dio _dio = Dio()
+    ..options.validateStatus = (s) => s != null && s < 600;
 
   static String _cleanJson(String raw) {
     return raw.replaceAll(RegExp(r'^```json\s*|^```\s*', multiLine: true), '').replaceAll(RegExp(r'```$'), '').trim();
@@ -1045,13 +1048,28 @@ class DualAIService {
     // 2. 根据归属拉取独立的 URL、Key 和 Model
     String url = await ConfigService.getConfigString('${taskType}_${engine}_url', engine == 'cloud' ? 'https://api.deepseek.com/v1' : 'http://localhost:1234/v1');
     String key = await ConfigService.getConfigString('${taskType}_${engine}_key', '');
+    // [修复] 如果非主任务的 API Key 为空则回退使用主 Key
+    if (key.isEmpty && taskType != 'chat') {
+      key = await ConfigService.getCloudApiKey();
+    }
     String model = await ConfigService.getConfigString('${taskType}_${engine}_model', '');
+    // [修复] 如果当前任务没有独立模型，则回退使用 chat 模型的配置
+    if (model.isEmpty && taskType != 'chat') {
+      model = await ConfigService.getConfigString('chat_${engine}_model', '');
+    }
 
     if (url.isEmpty) throw Exception("⚠️ [$taskType] 业务流的 $engine 节点 URL 缺失，请前往设置面板配置");
 
     // 3. 智能拼接路由（自动适配 OpenAI 标准后端）
     String cleanBaseUrl = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
-    String apiUrl = taskType == 'embedding' ? "$cleanBaseUrl/embeddings" : "$cleanBaseUrl/chat/completions";
+    String apiUrl;
+    if (taskType == 'embedding') {
+      apiUrl = "$cleanBaseUrl/embeddings";
+    } else if (taskType == 'asr') {
+      apiUrl = "$cleanBaseUrl/audio/transcriptions";
+    } else {
+      apiUrl = "$cleanBaseUrl/chat/completions";
+    }
 
     AppLogger.log("🔀 路由分配 | 业务流: [$taskType] -> 节点: $engine -> 模型: $model");
 
@@ -1394,6 +1412,7 @@ $question
         options: Options(
           headers: {"Authorization": "Bearer $apiKey", "Content-Type": "application/json"},
           receiveTimeout: const Duration(minutes: 3),
+          validateStatus: (s) => s != null && s < 600,
         ),
         data: {
           "model": "deepseek-chat",
@@ -1405,11 +1424,25 @@ $question
         },
       );
       
+      // 响应级别检查
+      if (response.statusCode == 401) {
+        AppLogger.log("问答请求被拒(401): API Key 无效或已过期，请检查云端配置", isError: true);
+        return "⚠️ API Key 无效或已过期，请在设置中重新配置云端 API Key";
+      }
+      if (response.statusCode != 200) {
+        AppLogger.log("问答请求返回非预期状态码: ${response.statusCode}", isError: true);
+        return "问答服务暂时不可用 (HTTP ${response.statusCode})，请稍后重试";
+      }
+      
       final usage = response.data['usage'];
       AppLogger.log("问答响应成功！消耗 Tokens:[Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
       return response.data['choices'][0]['message']['content'].toString().trim();
     } catch (e) {
       AppLogger.log("问答请求异常: $e", isError: true);
+      // 检测 DioException 中的 401 状态码
+      if (e is DioException && e.response?.statusCode == 401) {
+        return "⚠️ API Key 无效或已过期，请在设置中重新配置云端 API Key";
+      }
       return "问答请求异常: $e";
     }
   }
@@ -1476,13 +1509,50 @@ ${jsonEncode(draft.toJson())}
       return null;
     }
   }
+
+  /// [新增] ASR 语音转写：上传音频/视频文件，返回转写文本
+  static Future<String> performASR(String filePath, {int maxRetries = 2}) async {
+    final engineCtx = await _buildEngineContext(taskType: 'asr');
+    if ((engineCtx["model"] as String).isEmpty) return "[未配置 ASR 模型]";
+
+    AppLogger.log("触发 ASR 转写模型 [${engineCtx["model"]}]，正在解析: ${path.basename(filePath)}");
+
+    final endPoint = engineCtx["url"];
+
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final formData = FormData.fromMap({
+          "model": engineCtx["model"],
+          "file": await MultipartFile.fromFile(filePath),
+          "response_format": "json",
+        });
+        final response = await _dio.post(
+          endPoint,
+          options: Options(
+            headers: {"Authorization": "Bearer ${engineCtx["key"]}"},
+            receiveTimeout: const Duration(minutes: 15),
+            sendTimeout: const Duration(minutes: 15),
+          ),
+          data: formData,
+        );
+        AppLogger.log("ASR 转写成功: ${path.basename(filePath)}");
+        return response.data['text'] as String? ?? "";
+      } catch (e) {
+        AppLogger.log("ASR 第 $attempt 次尝试失败: $e", isError: true);
+        if (attempt == maxRetries) throw Exception("ASR 服务重试耗尽: $e");
+        await Future.delayed(Duration(seconds: attempt * 3));
+      }
+    }
+    return "";
+  }
 }
 
 // ==========================================
 // 4. 服务层 - 附加轻量级向量检索服务 (修改片段)
 // ==========================================
 class SemanticRetrievalService {
-  static final Dio _dio = Dio();
+  static final Dio _dio = Dio()
+    ..options.validateStatus = (s) => s != null && s < 600;
 
   static List<String> _chunkText(String text, {int chunkSize = 600, int overlap = 100}) {
     if (text.length <= chunkSize) return [text];
@@ -1584,6 +1654,77 @@ class SemanticRetrievalService {
     
     int maxSelected = math.min(10, scoredChunks.length);
     return scoredChunks.take(maxSelected).map((e) => e.key).toList();
+  }
+}
+
+// ==========================================
+// 4b. 视频解析服务（基于 FFmpeg / ffprobe）
+// ==========================================
+class VideoParsingService {
+  /// 使用 ffprobe 获取视频时长（秒），失败返回 -1
+  static Future<double> probeDuration(String filePath) async {
+    try {
+      final result = await io.Process.run(
+        'ffprobe',
+        [
+          '-v', 'error',
+          '-show_entries', 'format=duration',
+          '-of', 'default=noprint_wrappers=1:nokey=1',
+          filePath,
+        ],
+      );
+      if (result.exitCode == 0 && (result.stdout as String).trim().isNotEmpty) {
+        double seconds = double.parse((result.stdout as String).trim());
+        AppLogger.log("视频时长探测 [$filePath] => ${seconds.toStringAsFixed(1)}s");
+        return seconds;
+      }
+    } catch (e) {
+      AppLogger.log("ffprobe 调用失败: $e", isError: true);
+    }
+    return -1;
+  }
+
+  /// 使用 ffmpeg 提取指定长度（秒）的音频片段到临时文件
+  static Future<String?> extractAudioSegment(
+    String videoPath, {
+    double startSec = 0,
+    double durationSec = 120,
+  }) async {
+    final ext = path.extension(videoPath).toLowerCase();
+    if (!['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'].contains(ext)) {
+      return null;
+    }
+
+    final tempDir = io.Directory.systemTemp.path;
+    final audioOut = "$tempDir/${DateTime.now().millisecondsSinceEpoch}_segment.mp3";
+
+    try {
+      final result = await io.Process.run(
+        'ffmpeg',
+        [
+          '-y',
+          '-ss', startSec.toStringAsFixed(2),
+          '-i', videoPath,
+          '-t', durationSec.toStringAsFixed(2),
+          '-ar', '16000',
+          '-ac', '1',
+          '-b:a', '32k',
+          audioOut,
+        ],
+      );
+      if (result.exitCode == 0) return audioOut;
+      AppLogger.log("ffmpeg 音频提取失败: ${result.stderr}", isError: true);
+    } catch (e) {
+      AppLogger.log("ffmpeg 调用异常: $e", isError: true);
+    }
+    return null;
+  }
+
+  /// 清理临时文件
+  static void cleanTempFile(String? filePath) {
+    if (filePath != null) {
+      try { io.File(filePath).deleteSync(); } catch (_) {}
+    }
   }
 }
 
@@ -2907,13 +3048,46 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         } else {
            if (_activePage == 0) {
                String content = "";
-               if (['.png', '.jpg', '.jpeg'].contains(ext)) {
-                  content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[图片模型禁用]";
-               } else if (ext == '.doc' || ext == '.docx') {
-                  content = await _parseWordDocument(filePath, ext);
-               } else {
-                  content = await _readTextFileSmart(filePath);
-               }
+                if (['.png', '.jpg', '.jpeg'].contains(ext)) {
+                   content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[图片模型禁用]";
+                } else if (['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'].contains(ext)) {
+                   // 视频/音频 → 提取音频片段 → ASR 转写
+                   content = "[ASR 转写中...]";
+                   try {
+                     AppLogger.log("🎥 检测到音视频文件，开始 ffprobe 探测时长: ${path.basename(filePath)}");
+                     final duration = await VideoParsingService.probeDuration(filePath);
+                     if (duration > 0) {
+                       double segmentLen = 120; // 每段 2 分钟
+                       int segments = (duration / segmentLen).ceil();
+                       segments = segments.clamp(1, 30); // 最多切 30 段
+                       List<String> transcribedParts = [];
+                       for (int seg = 0; seg < segments; seg++) {
+                         String? audioPath = await VideoParsingService.extractAudioSegment(
+                           filePath,
+                           startSec: seg * segmentLen,
+                           durationSec: segmentLen,
+                         );
+                         if (audioPath != null) {
+                           String text = await DualAIService.performASR(audioPath);
+                           transcribedParts.add(text);
+                           VideoParsingService.cleanTempFile(audioPath);
+                         }
+                         if (seg < segments - 1) await Future.delayed(const Duration(seconds: 1));
+                       }
+                       content = transcribedParts.join("\n\n[段落分割]\n\n");
+                       if (content.trim().isEmpty) content = "[ASR 转写未返回有效文本]";
+                     } else {
+                       content = "[视频探测失败或时长过短]";
+                     }
+                   } catch (e) {
+                     AppLogger.log("❌ 音视频转写异常: $e", isError: true);
+                     content = "[音视频转写出错: $e]";
+                   }
+                } else if (ext == '.doc' || ext == '.docx') {
+                   content = await _parseWordDocument(filePath, ext);
+                } else {
+                   content = await _readTextFileSmart(filePath);
+                }
                
                if (mounted) {
                   setState(() {
@@ -2977,7 +3151,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   Future<void> _pickFiles() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       type: FileType.custom, 
-      allowedExtensions: ['txt', 'md', 'json', 'csv', 'png', 'jpg', 'jpeg', 'pdf', 'doc', 'docx'],
+      allowedExtensions: ['txt', 'md', 'json', 'csv', 'png', 'jpg', 'jpeg', 'pdf', 'doc', 'docx', 'mp4', 'mov', 'mkv', 'avi', 'flv', 'webm', 'm4a'],
       allowMultiple: true, 
     );
     if (result != null) {
@@ -2990,7 +3164,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     if (selectedDirectory != null) {
       AppLogger.log("📂 正在扫描目录结构: $selectedDirectory");
       final dir = io.Directory(selectedDirectory);
-      final validExts = ['.txt', '.md', '.json', '.csv', '.png', '.jpg', '.jpeg', '.pdf', '.doc', '.docx'];
+      final validExts = ['.txt', '.md', '.json', '.csv', '.png', '.jpg', '.jpeg', '.pdf', '.doc', '.docx', '.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'];
       
       List<io.File> collectedFiles = [];
       try {
@@ -3135,6 +3309,33 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     }
   }
 
+  // [新增] 导出原始文本数据到文件
+  void _exportKnowledgeText() async {
+    String fullText = _knowledgeTextBuffer.toString();
+    if (fullText.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ 知识库内容为空，无法导出")));
+      return;
+    }
+    String? outputPath = await FilePicker.platform.saveFile(
+      dialogTitle: '选择导出位置',
+      fileName: 'knowledge_export_${DateTime.now().millisecondsSinceEpoch}.txt',
+      type: FileType.custom,
+      allowedExtensions: ['txt'],
+    );
+    if (outputPath != null) {
+      try {
+        await io.File(outputPath).writeAsString(fullText);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ 知识库文本已成功导出到: $outputPath")));
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ 导出失败: $e")));
+        }
+      }
+    }
+  }
+
   // ==========================================
   // UI：文件与日志控制台模块
   // ==========================================
@@ -3243,7 +3444,16 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     final provider = context.watch<ExamProvider>();
 
     return Scaffold(
-      appBar: AppBar(title: const Text("混合题型生成器")),
+      appBar: AppBar(
+        title: const Text("混合题型生成器"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.file_download_outlined),
+            tooltip: "导出原始文本数据",
+            onPressed: _exportKnowledgeText,
+          ),
+        ],
+      ),
       body: provider.isLoading 
       ? Center(
           child: Padding(
@@ -3445,6 +3655,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     {"id": "vision", "name": "视觉多模态流 (OCR图文解析)"},
     {"id": "embedding", "name": "语义降维流 (向量化/Embedding)"},
     {"id": "rerank", "name": "特征强化流 (知识 Rerank 重排序)"},
+    {"id": "asr", "name": "语音转写流 (音视频 ASR 解析)"},
   ];
 
   // 状态维护矩阵
@@ -3946,7 +4157,10 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
           final localUrl = await ConfigService.getLmStudioUrl();
           final response = await Dio().post(
             '$localUrl/chat/completions',
-            options: Options(receiveTimeout: const Duration(minutes: 5)),
+            options: Options(
+              receiveTimeout: const Duration(minutes: 5),
+              validateStatus: (s) => s != null && s < 600,
+            ),
             data: {
               "model": rerankModel, 
               "messages":[
@@ -3960,7 +4174,7 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
           AppLogger.log("Rerank 处理完毕，消耗 Tokens: [Prompt: ${usage?['prompt_tokens']}, Completion: ${usage?['completion_tokens']}]");
           finalText = response.data['choices'][0]['message']['content'];
         } catch (e) {
-          AppLogger.log("Rerank 模型返回异常，使用原始文本保存", isError: true);
+          AppLogger.log("Rerank 模型返回异常，使用原始文本保存: $e", isError: true);
         }
       }
     }
@@ -3999,6 +4213,33 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
   }
 
   /// 渲染逻辑：展示生成的 DAG Mermaid 代码，并在 Linux 桌面端提供一键复制与提示
+  // [新增] 导出原始文本数据到文件
+  void _exportKnowledgeText() async {
+    String fullText = _textController.text.trim();
+    if (fullText.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ 知识库内容为空，无法导出")));
+      return;
+    }
+    String? outputPath = await FilePicker.platform.saveFile(
+      dialogTitle: '选择导出位置',
+      fileName: 'knowledge_export_${DateTime.now().millisecondsSinceEpoch}.txt',
+      type: FileType.custom,
+      allowedExtensions: ['txt'],
+    );
+    if (outputPath != null) {
+      try {
+        await io.File(outputPath).writeAsString(fullText);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ 知识库文本已成功导出到: $outputPath")));
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ 导出失败: $e")));
+        }
+      }
+    }
+  }
+
   void _showDAGDialog(String dagCode) {
     showDialog(
       context: context,
@@ -4066,6 +4307,11 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
             icon: _isSaving ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.save),
             tooltip: "保存并覆盖",
             onPressed: _isSaving ? null : _saveChanges,
+          ),
+          IconButton(
+            icon: const Icon(Icons.file_download_outlined),
+            tooltip: "导出原始文本数据",
+            onPressed: _exportKnowledgeText,
           ),
           const SizedBox(width: 16),
         ],
