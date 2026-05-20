@@ -838,17 +838,41 @@ class ExamQuestion {
   };
 }
 
+class KnowledgeProject {
+  final int? id;
+  final String name;
+  final String rootPath;
+  final int topicCount;
+  final int createdAt;
+
+  KnowledgeProject({this.id, required this.name, required this.rootPath, this.topicCount = 0, required this.createdAt});
+
+  Map<String, dynamic> toMap() => {
+    'id': id, 'name': name, 'rootPath': rootPath, 'topicCount': topicCount, 'createdAt': createdAt,
+  };
+
+  factory KnowledgeProject.fromMap(Map<String, dynamic> map) => KnowledgeProject(
+    id: map['id'] as int?,
+    name: map['name'] as String,
+    rootPath: map['rootPath'] as String,
+    topicCount: map['topicCount'] as int? ?? 0,
+    createdAt: map['createdAt'] as int,
+  );
+}
+
 class SavedExam {
   final int? id;
   final String title;
   final String examJson; 
   final String knowledgeBase; // 新增：保存原始上下文，用于刷新题目
   final int createdAt;
+  final int? projectId; // [v5] 所属项目ID，无项目时为 null
+  final String? sourcePath; // [v5] 来源子目录路径
 
-  SavedExam({this.id, required this.title, required this.examJson, this.knowledgeBase = "", required this.createdAt});
+  SavedExam({this.id, required this.title, required this.examJson, this.knowledgeBase = "", required this.createdAt, this.projectId, this.sourcePath});
 
   Map<String, dynamic> toMap() => {
-    'id': id, 'title': title, 'examJson': examJson, 'knowledgeBase': knowledgeBase, 'createdAt': createdAt,
+    'id': id, 'title': title, 'examJson': examJson, 'knowledgeBase': knowledgeBase, 'createdAt': createdAt, 'projectId': projectId, 'sourcePath': sourcePath,
   };
 
   factory SavedExam.fromMap(Map<String, dynamic> map) => SavedExam(
@@ -857,6 +881,8 @@ class SavedExam {
     examJson: map['examJson'] as String,
     knowledgeBase: map['knowledgeBase'] as String? ?? "", // 兼容老数据
     createdAt: map['createdAt'] as int,
+    projectId: map['projectId'] as int?,
+    sourcePath: map['sourcePath'] as String?,
   );
 
   List<ExamQuestion> get parsedQuestions {
@@ -912,14 +938,25 @@ class ExamRecord {
     if (!await docDir.exists()) await docDir.create(recursive: true);
     String dbPath = path.join(docDir.path, 'exams_v2.db'); 
     
-    // [修改] 版本升级至 4，引入 app_config 表用于持久化模型配置
-    return await openDatabase(dbPath, version: 4, onCreate: (db, version) async {
+    // [修改] 版本升级至 5，引入知识库项目（Project）管理
+    return await openDatabase(dbPath, version: 5, onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE saved_exams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             examJson TEXT NOT NULL,
             knowledgeBase TEXT NOT NULL,
+            createdAt INTEGER NOT NULL,
+            projectId INTEGER,
+            sourcePath TEXT
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE knowledge_projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            rootPath TEXT NOT NULL,
+            topicCount INTEGER DEFAULT 0,
             createdAt INTEGER NOT NULL
           )
         ''');
@@ -978,6 +1015,19 @@ class ExamRecord {
             )
           ''');
         }
+        if (oldVersion < 5) {
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS knowledge_projects (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              rootPath TEXT NOT NULL,
+              topicCount INTEGER DEFAULT 0,
+              createdAt INTEGER NOT NULL
+            )
+          ''');
+          await db.execute('ALTER TABLE saved_exams ADD COLUMN projectId INTEGER');
+          await db.execute('ALTER TABLE saved_exams ADD COLUMN sourcePath TEXT');
+        }
       });
     }
 
@@ -1018,7 +1068,70 @@ class ExamRecord {
         whereArgs: [exam.id],
       );
     }
+
+    // ========== 知识库项目 (Project) CRUD ==========
     
+    static Future<int> saveProject(KnowledgeProject project) async {
+      final db = await database;
+      return await db.insert('knowledge_projects', project.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+
+    static Future<List<KnowledgeProject>> getAllProjects() async {
+      final db = await database;
+      final maps = await db.query('knowledge_projects', orderBy: 'createdAt DESC');
+      return maps.map((m) => KnowledgeProject.fromMap(m)).toList();
+    }
+
+    static Future<KnowledgeProject?> getProject(int id) async {
+      final db = await database;
+      final maps = await db.query('knowledge_projects', where: 'id = ?', whereArgs: [id], limit: 1);
+      if (maps.isNotEmpty) return KnowledgeProject.fromMap(maps.first);
+      return null;
+    }
+
+    static Future<int> updateProject(KnowledgeProject project) async {
+      final db = await database;
+      return await db.update(
+        'knowledge_projects',
+        project.toMap(),
+        where: 'id = ?',
+        whereArgs: [project.id],
+      );
+    }
+
+    /// 删除项目及旗下所有 exams（级联删除 embeddings 和 records）
+    static Future<void> deleteProjectCascade(int id) async {
+      final db = await database;
+      await db.transaction((txn) async {
+        // 获取项目下所有 exam IDs
+        final examMaps = await txn.query('saved_exams', columns: ['id'], where: 'projectId = ?', whereArgs: [id]);
+        final examIds = examMaps.map((m) => m['id'] as int).toList();
+        // 删除每个 exam 的 embeddings 和 records
+        for (final eid in examIds) {
+          await txn.delete('exam_embeddings', where: 'examId = ?', whereArgs: [eid]);
+          await txn.delete('exam_records', where: 'examId = ?', whereArgs: [eid]);
+        }
+        // 删除项目下的所有 exams
+        await txn.delete('saved_exams', where: 'projectId = ?', whereArgs: [id]);
+        // 删除项目本身
+        await txn.delete('knowledge_projects', where: 'id = ?', whereArgs: [id]);
+      });
+    }
+
+    /// 获取项目下所有 exams
+    static Future<List<SavedExam>> getExamsByProject(int projectId) async {
+      final db = await database;
+      final maps = await db.query('saved_exams', where: 'projectId = ?', whereArgs: [projectId], orderBy: 'createdAt ASC');
+      return maps.map((m) => SavedExam.fromMap(m)).toList();
+    }
+
+    /// 获取无项目归属的所有 exams（用于"全部题库"视图）
+    static Future<List<SavedExam>> getExamsWithoutProject() async {
+      final db = await database;
+      final maps = await db.query('saved_exams', where: 'projectId IS NULL', orderBy: 'createdAt DESC');
+      return maps.map((m) => SavedExam.fromMap(m)).toList();
+    }
+
     // [新增] 向量库持久化接口
     static Future<void> saveEmbeddings(int examId, List<Map<String, dynamic>> embeddings) async {
       final db = await database;
@@ -1282,6 +1395,13 @@ class DualAIService {
     final combinedResult = partResults.join("\n\n");
     AppLogger.log("✅ 切割识别完成，共 ${parts.length} 份，已合并为最终结果");
     return combinedResult;
+  }
+
+  /// [新增] 公开的逐份OCR方法，供 _processFileQueue 逐份调用，支持重试
+  static Future<String> performSingleOCRPart(Uint8List bytes, String fileLabel, {int maxRetries = 3}) async {
+    final engineCtx = await _buildEngineContext(taskType: 'vision');
+    if ((engineCtx["model"] as String).isEmpty) return "[未配置视觉模型]";
+    return await _performSingleOCR(bytes, fileLabel, engineCtx, maxRetries);
   }
 
   /// 执行单张图片的 OCR 识别（内部方法）
@@ -1804,6 +1924,61 @@ class SemanticRetrievalService {
     int maxSelected = math.min(10, scoredChunks.length);
     return scoredChunks.take(maxSelected).map((e) => e.key).toList();
   }
+
+  /// [新增] 跨话题向量检索：在多个 examId 中检索，全局排序后返回带来源标记的结果
+  static Future<List<Map<String, dynamic>>> searchContextMultiple(List<int> examIds, String query, {int maxResults = 15}) async {
+    final engineCtx = await DualAIService._buildEngineContext(taskType: 'embedding');
+    final String model = engineCtx["model"];
+    final String url = engineCtx["url"];
+    final String key = engineCtx["key"];
+
+    if (model.isEmpty || examIds.isEmpty) return [];
+
+    // 获取所有 examIds 的向量数据
+    final List<Map<String, dynamic>> allVectors = [];
+    for (final examId in examIds) {
+      final vectors = await DatabaseHelper.getEmbeddingsForExam(examId);
+      // 给每条向量标记来源 examId
+      for (final v in vectors) {
+        v['searchExamId'] = examId;
+      }
+      allVectors.addAll(vectors);
+    }
+
+    if (allVectors.isEmpty) return [];
+
+    // Embed query
+    List<double> queryVector = [];
+    try {
+      final qRes = await _dio.post(
+        url,
+        options: Options(headers: {"Authorization": "Bearer $key", "Content-Type": "application/json"}),
+        data: {"model": model, "input": query}
+      );
+      queryVector = List<double>.from(qRes.data['data'][0]['embedding']);
+    } catch (e) {
+      AppLogger.log("跨话题向量生成失败: $e", isError: true);
+      return [];
+    }
+
+    // 计算所有 chunk 的相似度
+    List<Map<String, dynamic>> scoredResults = [];
+    for (final record in allVectors) {
+      final chunkVec = List<double>.from(jsonDecode(record['vectorJson']));
+      final sim = _cosineSimilarity(queryVector, chunkVec);
+      scoredResults.add({
+        'chunkText': record['chunkText'] as String,
+        'examId': record['searchExamId'],
+        'similarity': sim,
+      });
+    }
+
+    // 全局排序
+    scoredResults.sort((a, b) => (b['similarity'] as double).compareTo(a['similarity'] as double));
+
+    final int selected = math.min(maxResults, scoredResults.length);
+    return scoredResults.take(selected).toList();
+  }
 }
 
 // ==========================================
@@ -2080,15 +2255,28 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
   List<SavedExam> _history =[];
+  List<KnowledgeProject> _projects = [];
+  late TabController _tabController;
 
   @override
-  void initState() { super.initState(); _loadHistory(); }
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _loadHistory();
+  }
+  
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
   
   Future<void> _loadHistory() async {
-    final list = await DatabaseHelper.getAllExams();
-    setState(() => _history = list);
+    final exams = await DatabaseHelper.getExamsWithoutProject();
+    final projects = await DatabaseHelper.getAllProjects();
+    if (mounted) setState(() { _history = exams; _projects = projects; });
   }
 
   void _startExam(SavedExam exam) {
@@ -2101,8 +2289,14 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text("AI 互动助教 工作台"),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.library_books), text: "全部题库"),
+            Tab(icon: Icon(Icons.folder_special), text: "项目管理"),
+          ],
+        ),
         actions: [
-          // [新增] 显式的亮色/暗色主题切换
           Consumer<ThemeProvider>(
             builder: (context, themeProvider, child) {
               bool isDark = Theme.of(context).brightness == Brightness.dark;
@@ -2116,144 +2310,152 @@ class _HomeScreenState extends State<HomeScreen> {
           IconButton(icon: const Icon(Icons.settings), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()))),
         ],
       ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children:[
-          Padding(padding: const EdgeInsets.all(16.0), child: Text("可用题库集", style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold))),
-          Expanded(
-            child: _history.isEmpty 
-            ? const Center(child: Text("暂无数据，点击下方按钮导入资料出题", style: TextStyle(color: Colors.grey)))
-            : ListView.builder(
-                itemCount: _history.length,
-                itemBuilder: (context, i) {
-                  final item = _history[i];
-                  return Card(
-                    margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: ListTile(
-                      leading: const CircleAvatar(child: Icon(Icons.menu_book)),
-                      title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.bold)),
-                      subtitle: Text("题量: ${item.parsedQuestions.length} | 题型覆盖单选/多选/填空/简答"),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // [修改] 指向统一的 KnowledgeInputScreen
-                          IconButton(
-                            icon: const Icon(Icons.edit_document, color: Colors.teal),
-                            tooltip: "编辑原始知识库",
-                            onPressed: () {
-                              if (item.knowledgeBase.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text("当前题库无原始知识库缓存，无法编辑。"))
-                                );
-                                return;
-                              }
-                              // 跳转到统一界面进行编辑
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(builder: (_) => KnowledgeInputScreen(existingExam: item))
-                              ).then((_) => _loadHistory());
-                            }
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          // === Tab 1: 全部题库（无项目归属的独立题库） ===
+          _history.isEmpty
+              ? const Center(child: Text("暂无独立题库，切换到「项目管理」标签导入项目目录", style: TextStyle(color: Colors.grey)))
+              : RefreshIndicator(
+                  onRefresh: _loadHistory,
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: _history.length,
+                    itemBuilder: (context, i) {
+                      final item = _history[i];
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        child: ListTile(
+                          leading: const CircleAvatar(child: Icon(Icons.menu_book)),
+                          title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Text("题量: ${item.parsedQuestions.length} | 题型覆盖单选/多选/填空/简答"),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.edit_document, color: Colors.teal),
+                                tooltip: "编辑原始知识库",
+                                onPressed: () {
+                                  if (item.knowledgeBase.isEmpty) return;
+                                  Navigator.push(context, MaterialPageRoute(builder: (_) => KnowledgeInputScreen(existingExam: item))).then((_) => _loadHistory());
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.refresh, color: Colors.blue),
+                                tooltip: "从原知识库生成新考题",
+                                onPressed: () {
+                                  if (item.knowledgeBase.isEmpty) return;
+                                  showDialog(
+                                    context: context,
+                                    builder: (ctx) => _RegenerateExamDialog(
+                                      exam: item,
+                                      onStart: (topic, count, difficulty, useEmbedding) async {
+                                        Navigator.pop(ctx);
+                                        final provider = context.read<ExamProvider>();
+                                        await provider.processAndGenerate(rawText: item.knowledgeBase, topic: topic, count: count, difficulty: difficulty, useEmbedding: useEmbedding);
+                                        _loadHistory();
+                                      },
+                                    ),
+                                  );
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.question_answer, color: Colors.purple),
+                                tooltip: "知识库问答与探讨",
+                                onPressed: () {
+                                  if (item.knowledgeBase.isEmpty) return;
+                                  Navigator.push(context, MaterialPageRoute(builder: (_) => ChatWithKnowledgeScreen(exam: item)));
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.storage, color: Colors.orange),
+                                tooltip: "手动构建向量索引",
+                                onPressed: () async {
+                                  if (item.knowledgeBase.isEmpty) return;
+                                  final embeddingModel = await ConfigService.getEmbeddingModel();
+                                  if (embeddingModel.isEmpty) {
+                                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("未配置 Embedding 模型")));
+                                    return;
+                                  }
+                                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在构建向量索引...")));
+                                  await SemanticRetrievalService.buildAndSaveIndex(item.id!, item.knowledgeBase);
+                                  if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 向量索引构建完成")));
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.list_alt, color: Colors.teal),
+                                tooltip: "管理题库题目",
+                                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamQuestionManagerScreen(exam: item))),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.manage_search, color: Colors.deepPurple),
+                                tooltip: "查询提取底层向量片段",
+                                onPressed: () {
+                                  if (item.knowledgeBase.isEmpty) return;
+                                  showDialog(context: context, builder: (_) => VectorSearchDialog(exam: item));
+                                },
+                              ),
+                              IconButton(icon: const Icon(Icons.history), tooltip: "查看历史记录", onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamHistoryScreen(exam: item)))),
+                              IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () async { await DatabaseHelper.deleteExam(item.id!); _loadHistory(); }),
+                            ],
                           ),
-                          // 重新从原知识库生成试卷（弹出配置对话框）
-                          IconButton(
-                            icon: const Icon(Icons.refresh, color: Colors.blue), 
-                            tooltip: "从原知识库生成新考题", 
-                            onPressed: () {
-                              if (item.knowledgeBase.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库为旧版本生成，无原始知识库缓存。")));
-                                return;
-                              }
-                              showDialog(
-                                context: context,
-                                builder: (ctx) => _RegenerateExamDialog(
-                                  exam: item,
-                                  onStart: (topic, count, difficulty, useEmbedding) async {
-                                    Navigator.pop(ctx);
-                                    final provider = context.read<ExamProvider>();
-                                    await provider.processAndGenerate(
-                                      rawText: item.knowledgeBase, topic: topic, count: count, difficulty: difficulty,
-                                      useEmbedding: useEmbedding,
-                                    );
-                                    _loadHistory();
-                                  },
-                                ),
-                              );
-                            }
-                          ),
-                          // [新增] 本地知识库 Q&A 对话功能
-                          IconButton(
-                            icon: const Icon(Icons.question_answer, color: Colors.purple),
-                            tooltip: "知识库问答与探讨",
-                            onPressed: () {
-                              if (item.knowledgeBase.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库无原始知识库，无法进行问答。")));
-                                return;
-                              }
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(builder: (_) => ChatWithKnowledgeScreen(exam: item))
-                              );
-                            }
-                          ),
-                          // [新增] 手动构建向量索引
-                          IconButton(
-                            icon: const Icon(Icons.storage, color: Colors.orange),
-                            tooltip: "手动构建向量索引",
-                            onPressed: () async {
-                              if (item.knowledgeBase.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库无原始知识库，无法构建向量索引。")));
-                                return;
-                              }
-                              final embeddingModel = await ConfigService.getEmbeddingModel();
-                              if (embeddingModel.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("未配置 Embedding 模型，请先前往设置页配置。")));
-                                return;
-                              }
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在构建向量索引，请稍候...")));
-                              await SemanticRetrievalService.buildAndSaveIndex(item.id!, item.knowledgeBase);
-                              if (context.mounted) {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 向量索引构建完成")));
-                              }
-                            }
-                          ),
-                          // [新增] 题库管理功能
-                          IconButton(
-                            icon: const Icon(Icons.list_alt, color: Colors.teal),
-                            tooltip: "管理题库题目",
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(builder: (_) => ExamQuestionManagerScreen(exam: item))
-                              );
-                            }
-                          ),
-                          // [新增] 查询提取底层向量片段
-                          IconButton(
-                            icon: const Icon(Icons.manage_search, color: Colors.deepPurple),
-                            tooltip: "查询提取底层向量片段",
-                            onPressed: () {
-                              if (item.knowledgeBase.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("当前题库无原始知识库数据，无法查询。")));
-                                return;
-                              }
-                              showDialog(context: context, builder: (_) => VectorSearchDialog(exam: item));
-                            }
-                          ),
-                          IconButton(icon: const Icon(Icons.history), tooltip: "查看历史记录", onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamHistoryScreen(exam: item)))),
-                          IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () async { await DatabaseHelper.deleteExam(item.id!); _loadHistory(); }),
-                        ],
-                      ),
-                      onTap: () => _startExam(item),
-                    ),
-                  );
-                },
-              )
-          )
+                          onTap: () => _startExam(item),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+          // === Tab 2: 项目管理 ===
+          _projects.isEmpty
+              ? const Center(child: Text("暂无项目，点击右下角按钮导入项目目录", style: TextStyle(color: Colors.grey)))
+              : RefreshIndicator(
+                  onRefresh: _loadHistory,
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: _projects.length,
+                    itemBuilder: (context, i) {
+                      final project = _projects[i];
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        child: ListTile(
+                          leading: const CircleAvatar(backgroundColor: Colors.indigo, child: Icon(Icons.folder, color: Colors.white)),
+                          title: Text(project.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Text("${project.topicCount} 个子话题 | ${path.basename(project.rootPath)}"),
+                          trailing: const Icon(Icons.chevron_right),
+                          onTap: () {
+                            Navigator.push(context, MaterialPageRoute(builder: (_) => ProjectDetailScreen(project: project))).then((_) => _loadHistory());
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
         icon: const Icon(Icons.add), label: const Text("导入资料制卷"),
-        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const KnowledgeInputScreen())).then((_) => _loadHistory()),
+        onPressed: () => showDialog(
+          context: context,
+          builder: (ctx) => SimpleDialog(
+            title: const Text("选择导入方式"),
+            children: [
+              SimpleDialogOption(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => const KnowledgeInputScreen())).then((_) => _loadHistory());
+                },
+                child: const ListTile(leading: Icon(Icons.note_add), title: Text("导入文件/文件夹（单题库）"), subtitle: Text("导入单个文件或文件夹为一个题库")),
+              ),
+              SimpleDialogOption(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => const ProjectImportScreen())).then((_) => _loadHistory());
+                },
+                child: const ListTile(leading: Icon(Icons.folder_special, color: Colors.indigo), title: Text("导入项目目录（多子话题）"), subtitle: Text("选择根目录，每个子目录作为独立话题")),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -3039,6 +3241,7 @@ class ImageSplitService {
   }
 
   /// 检查是否需要切割，并返回切割后的图片字节列表。
+  /// 采用动态阈值切割（非固定份数）：每份 maxHeight×maxWidth，最后一份取剩余。
   /// 返回结构：List<Map>，每项含 {bytes, label}，label 用于标记位置。
   static Future<List<Map<String, dynamic>>> splitImage(String filePath) async {
     final bytes = await io.File(filePath).readAsBytes();
@@ -3055,33 +3258,32 @@ class ImageSplitService {
     final maxHeight = await getMaxHeight();
     final maxWidth = await getMaxWidth();
     final smartSplit = await isSmartSplitEnabled();
-    final hParts = await getHorizontalParts();
-    final vParts = await getVerticalParts();
 
     AppLogger.log("📐 图片尺寸: ${img.width}x${img.height}, 阈值: ${maxWidth}x${maxHeight}");
 
     final List<Map<String, dynamic>> result = [];
 
-    // 先检查高度是否超过阈值 — 横向切割（上下分）
-    if (img.height > maxHeight && hParts > 1) {
-      final partHeight = (img.height / hParts).ceil();
-      AppLogger.log("✂️ 图片高度(${img.height}px)超过阈值(${maxHeight}px)，执行横向切割为 $hParts 份");
+    // 动态横向切割：高度超标时按 maxHeight 自动计算份数
+    if (img.height > maxHeight) {
+      final partsCount = (img.height / maxHeight).ceil();
+      final partHeight = (img.height / partsCount).ceil();
+      AppLogger.log("✂️ 图片高度(${img.height}px)超过阈值(${maxHeight}px)，动态切割为 $partsCount 份");
 
-      for (int i = 0; i < hParts; i++) {
+      for (int i = 0; i < partsCount; i++) {
         int yStart = i * partHeight;
-        int yEnd = (i == hParts - 1) ? img.height : (i + 1) * partHeight;
+        int yEnd = (i == partsCount - 1) ? img.height : (i + 1) * partHeight;
 
-        // 智能切割：寻找自然分割线（空白行）
         if (smartSplit) {
+          // 智能切割：寻找空白行作为自然分割点
           if (i > 0) {
             yStart = _findBestSplitY(img, yStart, partHeight ~/ 4);
           }
-          if (i < hParts - 1) {
+          if (i < partsCount - 1) {
             yEnd = _findBestSplitY(img, yEnd, partHeight ~/ 4);
           }
-          // 应用10%重叠区域，确保边界文本完整
+          // 10%重叠区域，确保边界文本完整
           if (i > 0) yStart = (yStart - (partHeight * 0.05).round()).clamp(0, img.height - 1);
-          if (i < hParts - 1) yEnd = (yEnd + (partHeight * 0.05).round()).clamp(0, img.height);
+          if (i < partsCount - 1) yEnd = (yEnd + (partHeight * 0.05).round()).clamp(0, img.height);
         }
 
         final part = img_lib.copyCrop(img, x: 0, y: yStart, width: img.width, height: (yEnd - yStart).clamp(1, img.height));
@@ -3090,30 +3292,30 @@ class ImageSplitService {
           'bytes': partBytes,
           'label': '上${i + 1}部分',
         });
-        AppLogger.log("  ✅ 横向切片 ${i + 1}/$hParts: y=$yStart~${yEnd} (${part.width}x${part.height})");
+        AppLogger.log("  ✅ 横向切片 ${i + 1}/$partsCount: y=$yStart~${yEnd} (${part.width}x${part.height})");
       }
       return result;
     }
 
-    // 再检查宽度是否超过阈值 — 纵向切割（左右分）
-    if (img.width > maxWidth && vParts > 1) {
-      final partWidth = (img.width / vParts).ceil();
-      AppLogger.log("✂️ 图片宽度(${img.width}px)超过阈值(${maxWidth}px)，执行纵向切割为 $vParts 份");
+    // 动态纵向切割：宽度超标时按 maxWidth 自动计算份数
+    if (img.width > maxWidth) {
+      final partsCount = (img.width / maxWidth).ceil();
+      final partWidth = (img.width / partsCount).ceil();
+      AppLogger.log("✂️ 图片宽度(${img.width}px)超过阈值(${maxWidth}px)，动态切割为 $partsCount 份");
 
-      for (int i = 0; i < vParts; i++) {
+      for (int i = 0; i < partsCount; i++) {
         int xStart = i * partWidth;
-        int xEnd = (i == vParts - 1) ? img.width : (i + 1) * partWidth;
+        int xEnd = (i == partsCount - 1) ? img.width : (i + 1) * partWidth;
 
         if (smartSplit) {
           if (i > 0) {
             xStart = _findBestSplitX(img, xStart, partWidth ~/ 4);
           }
-          if (i < vParts - 1) {
+          if (i < partsCount - 1) {
             xEnd = _findBestSplitX(img, xEnd, partWidth ~/ 4);
           }
-          // 应用10%重叠区域
           if (i > 0) xStart = (xStart - (partWidth * 0.05).round()).clamp(0, img.width - 1);
-          if (i < vParts - 1) xEnd = (xEnd + (partWidth * 0.05).round()).clamp(0, img.width);
+          if (i < partsCount - 1) xEnd = (xEnd + (partWidth * 0.05).round()).clamp(0, img.width);
         }
 
         final part = img_lib.copyCrop(img, x: xStart, y: 0, width: (xEnd - xStart).clamp(1, img.width), height: img.height);
@@ -3122,7 +3324,7 @@ class ImageSplitService {
           'bytes': partBytes,
           'label': '左${i + 1}部分',
         });
-        AppLogger.log("  ✅ 纵向切片 ${i + 1}/$vParts: x=$xStart~${xEnd} (${part.width}x${part.height})");
+        AppLogger.log("  ✅ 纵向切片 ${i + 1}/$partsCount: x=$xStart~${xEnd} (${part.width}x${part.height})");
       }
       return result;
     }
@@ -3585,9 +3787,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     setState(() {
       if (_activeFile != null) {
         String ext = path.extension(_activeFile!).toLowerCase();
-        if (ext == '.pdf') {
-          AppLogger.log("⏭️ 手动跳过引发崩溃的异常页: ${path.basename(_activeFile!)} (第 $_activePage 页)");
-          _activePage++; // 仅跳过当前页，不丢弃整个文件
+        if (ext == '.pdf' || ['.png', '.jpg', '.jpeg'].contains(ext)) {
+          AppLogger.log("⏭️ 手动跳过引发崩溃的异常份: ${path.basename(_activeFile!)} (第 $_activePage 份)");
+          _activePage++; // 仅跳过当前份，不丢弃整个文件
         } else {
           AppLogger.log("⏭️ 手动跳过异常文件: ${path.basename(_activeFile!)}");
           _activeFile = null;
@@ -3745,14 +3947,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
               if ((_visionMode == 'auto' || _visionMode == 'ocr') && _ocrEngine == 'native' && io.Platform.isLinux) {
               await _parsePdfWithOCR(filePath, _activePage, (page, total, text) async {
                  if (mounted && !_isPaused) {
-                    // [修复-乱码] 先对 OCR 文本进行纠错（修正乱码），再存入知识库
-                    String correctedText = text;
-                    try {
-                      correctedText = await DualAIService.fixOcrText(text);
-                    } catch (_) {
-                      // fixOcrText 失败时降级使用原始文本，不中断流程
-                    }
-                    await _knowledgeStore!.append(correctedText);
+                    await _knowledgeStore!.append(text);
                     if (mounted) {
                        setState(() {
                           _totalParsedChars = _knowledgeStore!.totalLength;
@@ -3769,9 +3964,6 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
            } else {
               if (_activePage == 0) {
                   String content = (_visionMode == 'auto' || _visionMode == 'ocr') ? await DualAIService.performLocalOCR(filePath) : "[PDF 模型禁用]";
-                  if ((_visionMode == 'auto' || _visionMode == 'ocr')) {
-                    content = await DualAIService.fixOcrText(content);
-                  }
                   if (mounted && !_isPaused) {
                     await _knowledgeStore!.append("\n$content");
                     if (mounted) setState(() {
@@ -3786,47 +3978,88 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
            if (_activePage == 0) {
                String content = "";
                 if (['.png', '.jpg', '.jpeg'].contains(ext)) {
-                   content = (_visionMode == 'auto' || _visionMode == 'ocr') ? await DualAIService.performLocalOCR(filePath) : "[图片模型禁用]";
-                   if ((_visionMode == 'auto' || _visionMode == 'ocr')) {
-                     content = await DualAIService.fixOcrText(content);
-                   }
-                } else if (['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'].contains(ext)) {
-                   content = "[音视频转写暂略]"; // 精简，按原实现包含转写逻辑即可
-                   try {
-                     final duration = await VideoParsingService.probeDuration(filePath);
-                     if (duration > 0) {
-                       double segmentLen = 120; 
-                       int segments = (duration / segmentLen).ceil().clamp(1, 30); 
-                       List<String> transcribedParts =[];
-                       for (int seg = 0; seg < segments; seg++) {
-                         if (_isPaused) break; // 允许在此处中断
-                         String? audioPath = await VideoParsingService.extractAudioSegment(filePath, startSec: seg * segmentLen, durationSec: segmentLen);
-                         if (audioPath != null) {
-                           transcribedParts.add(await DualAIService.performASR(audioPath));
-                           VideoParsingService.cleanTempFile(audioPath);
-                         }
-                       }
-                       content = transcribedParts.join("\n\n[段落分割]\n\n");
-                     }
-                   } catch (e) {}
-                } else if (ext == '.doc' || ext == '.docx') {
-                   content = await _parseWordDocument(filePath, ext);
-                } else {
-                   content = await _readTextFileSmart(filePath);
+              // [修改] 图片处理改为逐份回调模式（与 PDF 逐页对等）
+              if (_visionMode == 'auto' || _visionMode == 'ocr') {
+                await _parseImageWithOCR(filePath, _activePage, (part, total, text) async {
+                  if (mounted && !_isPaused) {
+                    await _knowledgeStore!.append(text);
+                    if (mounted) {
+                      setState(() {
+                        _totalParsedChars = _knowledgeStore!.totalLength;
+                        _activePage = part + 1;
+                        _pdfCurrentPage = part + 1;
+                        _pdfTotalPages = total;
+                      });
+                      await _updatePreviewAsync();
+                    }
+                    await _saveTaskState();
+                  }
+                });
+              } else {
+                if (_activePage == 0 && mounted) {
+                  await _knowledgeStore!.append("\n--- 📄 来源: ${path.basename(filePath)} ---\n[图片模型禁用]");
                 }
-               
-               if (mounted && !_isPaused) {
+              }
+            } else if (['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'].contains(ext)) {
+               content = "[音视频转写暂略]"; // 精简，按原实现包含转写逻辑即可
+               try {
+                 final duration = await VideoParsingService.probeDuration(filePath);
+                 if (duration > 0) {
+                   double segmentLen = 120; 
+                   int segments = (duration / segmentLen).ceil().clamp(1, 30); 
+                   List<String> transcribedParts =[];
+                   for (int seg = 0; seg < segments; seg++) {
+                     if (_isPaused) break; // 允许在此处中断
+                     String? audioPath = await VideoParsingService.extractAudioSegment(filePath, startSec: seg * segmentLen, durationSec: segmentLen);
+                     if (audioPath != null) {
+                       transcribedParts.add(await DualAIService.performASR(audioPath));
+                       VideoParsingService.cleanTempFile(audioPath);
+                     }
+                   }
+                   content = transcribedParts.join("\n\n[段落分割]\n\n");
+                 }
+               } catch (e) {}
+                if (mounted && !_isPaused) {
                   final isEmpty = _knowledgeStore?.totalLength == 0;
                   final prefix = isEmpty ? "" : "\n\n";
                   await _knowledgeStore!.append("$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content");
                   if (mounted) {
-                     setState(() {
-                        _totalParsedChars = _knowledgeStore!.totalLength;
-                        _activePage = 1;
-                     });
-                     await _updatePreviewAsync();
+                    setState(() {
+                      _totalParsedChars = _knowledgeStore!.totalLength;
+                      _activePage = 1;
+                    });
+                    await _updatePreviewAsync();
                   }
-               }
+                }
+            } else if (ext == '.doc' || ext == '.docx') {
+               content = await _parseWordDocument(filePath, ext);
+                if (mounted && !_isPaused) {
+                  final isEmpty = _knowledgeStore?.totalLength == 0;
+                  final prefix = isEmpty ? "" : "\n\n";
+                  await _knowledgeStore!.append("$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content");
+                  if (mounted) {
+                    setState(() {
+                      _totalParsedChars = _knowledgeStore!.totalLength;
+                      _activePage = 1;
+                    });
+                    await _updatePreviewAsync();
+                  }
+                }
+            } else {
+               content = await _readTextFileSmart(filePath);
+                if (mounted && !_isPaused) {
+                  final isEmpty = _knowledgeStore?.totalLength == 0;
+                  final prefix = isEmpty ? "" : "\n\n";
+                  await _knowledgeStore!.append("$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content");
+                  if (mounted) {
+                    setState(() {
+                      _totalParsedChars = _knowledgeStore!.totalLength;
+                      _activePage = 1;
+                    });
+                    await _updatePreviewAsync();
+                  }
+                }
+            }
            }
         }
 
@@ -3988,6 +4221,43 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
           await f.delete();
         }
       } catch (_) {}
+    }
+  }
+
+  // [新增] 图片逐份解析（与 PDF 逐页解析对等），支持断点续传
+  /// filePath: 图片路径
+  /// startPart: 起始份数（1-indexed，存储在 _activePage）
+  /// onPart: 每份识别完成后的回调 (partIndex, totalParts, text)
+  Future<void> _parseImageWithOCR(String filePath, int startPart, Function(int part, int total, String text) onPart) async {
+    // 1. 获取切割份数
+    final parts = await ImageSplitService.splitImage(filePath);
+    if (parts.isEmpty) {
+      throw Exception("图片切割失败或无法解码");
+    }
+
+    final totalParts = parts.length;
+    if (totalParts == 1) {
+      // 无需切割：直接单次识别
+      final bytes = parts.first['bytes'] as Uint8List;
+      final text = await DualAIService.performSingleOCRPart(bytes, path.basename(filePath));
+      onPart(0, 1, "\n[图片完整提取]:\n$text\n");
+      return;
+    }
+
+    // 需要切割：从 startPart 开始逐份识别
+    final firstPart = startPart > 0 ? startPart.clamp(0, totalParts - 1) : 0;
+    for (int i = firstPart; i < totalParts; i++) {
+      if (!mounted || _isPaused) break;
+
+      final bytes = parts[i]['bytes'] as Uint8List;
+      final partLabel = parts[i]['label'] as String;
+
+      AppLogger.log("📷 OCR 识别中: ${path.basename(filePath)} [${partLabel}] - 第 ${i + 1}/${totalParts} 份");
+      final partText = await DualAIService.performSingleOCRPart(bytes, "${path.basename(filePath)}[$partLabel]");
+      onPart(i, totalParts, "\n===== 图片${partLabel}识别结果 =====\n$partText\n");
+
+      // 份间延迟避免频率限制
+      if (i < totalParts - 1) await Future.delayed(const Duration(seconds: 2));
     }
   }
 
@@ -4180,7 +4450,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                     const SizedBox(width: 12),
                     Text(
                       _pdfTotalPages > 0
-                          ? "文件: $_processedFilesCount/$_totalFilesToProcess | PDF页: $_pdfCurrentPage/$_pdfTotalPages"
+                          ? "文件: $_processedFilesCount/$_totalFilesToProcess | 页/份: $_pdfCurrentPage/$_pdfTotalPages"
                           : "流水线运行中: $_processedFilesCount/$_totalFilesToProcess",
                       style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary)
                     ),
@@ -4474,6 +4744,951 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
 }
 
 // ==========================================
+// [新增] 项目导入界面 - 选择根目录后扫描子目录，每个子目录独立存储为 SavedExam
+// ==========================================
+class ProjectImportScreen extends StatefulWidget {
+  const ProjectImportScreen({super.key});
+  @override
+  State<ProjectImportScreen> createState() => _ProjectImportScreenState();
+}
+
+class _ProjectImportScreenState extends State<ProjectImportScreen> {
+  String? _rootPath;
+  final TextEditingController _projectNameCtrl = TextEditingController();
+  bool _useEmbedding = true;
+  bool _isScanning = false;
+  bool _isImporting = false;
+  
+  // 子目录条目: {name, path, checked, status}
+  List<Map<String, dynamic>> _subdirs = [];
+  
+  // 进度统计
+  int _importedCount = 0;
+  int _totalSelected = 0;
+  String _currentStatus = "";
+  
+  final List<String> _logLines = ["[INFO] 项目导入系统已就绪"];
+  final ScrollController _logScrollController = ScrollController();
+  StreamSubscription? _logSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _logSubscription = AppLogger.stream.listen((log) {
+      if (!mounted) return;
+      setState(() {
+        _logLines.add(log);
+        if (_logLines.length > 200) _logLines.removeAt(0);
+      });
+      Future.delayed(const Duration(milliseconds: 50), () {
+        if (_logScrollController.hasClients) {
+          _logScrollController.jumpTo(_logScrollController.position.maxScrollExtent);
+        }
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _logSubscription?.cancel();
+    _projectNameCtrl.dispose();
+    _logScrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickRootDirectory() async {
+    String? selected = await FilePicker.platform.getDirectoryPath();
+    if (selected == null) return;
+    
+    setState(() {
+      _rootPath = selected;
+      _projectNameCtrl.text = path.basename(selected);
+      _isScanning = true;
+      _subdirs.clear();
+    });
+    
+    AppLogger.log("📂 开始扫描目录: $selected");
+    
+    try {
+      final rootDir = io.Directory(selected);
+      final entities = await rootDir.list().toList();
+      final subdirs = entities.whereType<io.Directory>().toList();
+      subdirs.sort((a, b) => path.basename(a.path).compareTo(path.basename(b.path)));
+      
+      final validExts = ['.txt', '.md', '.json', '.csv', '.png', '.jpg', '.jpeg', '.pdf', '.doc', '.docx', '.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'];
+      
+      for (final dir in subdirs) {
+        // 扫描子目录内是否有支持的文件
+        bool hasFiles = false;
+        try {
+          await for (final entity in dir.list(recursive: true, followLinks: false)) {
+            if (entity is io.File) {
+              final ext = path.extension(entity.path).toLowerCase();
+              if (validExts.contains(ext)) {
+                hasFiles = true;
+                break;
+              }
+            }
+          }
+        } catch (_) {}
+        
+        setState(() {
+          _subdirs.add({
+            'name': path.basename(dir.path),
+            'path': dir.path,
+            'checked': hasFiles,
+            'hasFiles': hasFiles,
+            'status': '待导入',
+          });
+        });
+      }
+      
+      AppLogger.log("✅ 扫描完成，发现 ${_subdirs.length} 个子目录（${_subdirs.where((d) => d['hasFiles']).length} 个包含支持文件）");
+    } catch (e) {
+      AppLogger.log("❌ 目录扫描异常: $e", isError: true);
+    }
+    
+    setState(() => _isScanning = false);
+  }
+
+  Future<void> _startImport() async {
+    final selected = _subdirs.where((d) => d['checked']).toList();
+    if (_rootPath == null || selected.isEmpty) return;
+    
+    setState(() {
+      _isImporting = true;
+      _importedCount = 0;
+      _totalSelected = selected.length;
+      _currentStatus = "准备开始导入...";
+    });
+
+    // 创建项目
+    final project = KnowledgeProject(
+      name: _projectNameCtrl.text.trim().isNotEmpty 
+          ? _projectNameCtrl.text.trim() 
+          : path.basename(_rootPath!),
+      rootPath: _rootPath!,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    final projectId = await DatabaseHelper.saveProject(project);
+    
+    for (int i = 0; i < selected.length; i++) {
+      final subdir = selected[i];
+      final subdirPath = subdir['path'] as String;
+      final subdirName = subdir['name'] as String;
+      
+      if (!mounted) break;
+      
+      setState(() {
+        _currentStatus = "正在导入 ($i+1/${selected.length}): $subdirName";
+      });
+      
+      AppLogger.log("📥 [${i+1}/${selected.length}] 开始导入子话题: $subdirName");
+      
+      try {
+        // 为该子目录创建独立的 ChunkedKnowledgeStore
+        final homeDir = io.Platform.environment['HOME'] ?? '.';
+        final chunksDir = '$homeDir/.ai_teacher/chunks/proj_${projectId}_${DateTime.now().millisecondsSinceEpoch}_$i';
+        final store = ChunkedKnowledgeStore(chunksDir);
+        
+        // 扫描子目录内所有支持的文件
+        final validExts = ['.txt', '.md', '.json', '.csv', '.png', '.jpg', '.jpeg', '.pdf', '.doc', '.docx', '.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'];
+        final List<io.File> collectedFiles = [];
+        try {
+          final dir = io.Directory(subdirPath);
+          final stream = dir.list(recursive: true, followLinks: false);
+          await for (final entity in stream) {
+            if (entity is io.File) {
+              final ext = path.extension(entity.path).toLowerCase();
+              if (validExts.contains(ext)) collectedFiles.add(entity);
+            }
+          }
+        } catch (e) {
+          AppLogger.log("⚠️ 扫描子目录文件失败: $e", isError: true);
+        }
+        
+        // 处理每个文件
+        for (final file in collectedFiles) {
+          if (!mounted) break;
+          final ext = path.extension(file.path).toLowerCase();
+          try {
+            String content = "";
+            if (['.png', '.jpg', '.jpeg'].contains(ext)) {
+              content = await DualAIService.performLocalOCR(file.path);
+            } else if (ext == '.pdf') {
+              content = await DualAIService.performLocalOCR(file.path);
+            } else if (['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'].contains(ext)) {
+              try {
+                final duration = await VideoParsingService.probeDuration(file.path);
+                if (duration > 0) {
+                  final segmentLen = 120.0;
+                  final segments = (duration / segmentLen).ceil().clamp(1, 30);
+                  final List<String> parts = [];
+                  for (int seg = 0; seg < segments; seg++) {
+                    final audioPath = await VideoParsingService.extractAudioSegment(file.path, startSec: seg * segmentLen, durationSec: segmentLen);
+                    if (audioPath != null) {
+                      parts.add(await DualAIService.performASR(audioPath));
+                      VideoParsingService.cleanTempFile(audioPath);
+                    }
+                  }
+                  content = parts.join("\n\n[段落分割]\n\n");
+                }
+              } catch (_) {}
+            } else if (ext == '.doc' || ext == '.docx') {
+              content = await _parseWordDoc(file.path, ext);
+            } else {
+              content = await _readTextFile(file.path);
+            }
+            
+            if (content.isNotEmpty) {
+              final prefix = store.totalLength == 0 ? "" : "\n\n";
+              await store.append("$prefix--- 📄 ${path.basename(file.path)} ---\n$content");
+            }
+          } catch (e) {
+            AppLogger.log("⚠️ 文件解析失败: ${file.path}: $e", isError: true);
+          }
+        }
+        
+        // 读取全部文本并保存为 SavedExam
+        final fullText = await store.readAll();
+        store.dispose();
+        
+        if (fullText.trim().isNotEmpty) {
+          final exam = SavedExam(
+            title: subdirName,
+            examJson: "[]",
+            knowledgeBase: fullText,
+            createdAt: DateTime.now().millisecondsSinceEpoch,
+            projectId: projectId,
+            sourcePath: subdirPath,
+          );
+          final examId = await DatabaseHelper.saveExam(exam);
+          
+          // 可选：构建向量索引
+          if (_useEmbedding) {
+            final embeddingModel = await ConfigService.getEmbeddingModel();
+            if (embeddingModel.isNotEmpty) {
+              AppLogger.log("🔨 正在为 [$subdirName] 构建向量索引...");
+              await SemanticRetrievalService.buildAndSaveIndex(examId, fullText);
+            }
+          }
+          
+          setState(() {
+            subdir['status'] = '✅ 完成 (${(fullText.length / 1000).toStringAsFixed(1)}K)';
+            _importedCount++;
+          });
+          AppLogger.log("✅ [$subdirName] 导入完成，${(fullText.length / 1000).toStringAsFixed(1)}K 文本");
+        } else {
+          setState(() {
+            subdir['status'] = '⚠️ 无有效内容';
+          });
+        }
+      } catch (e) {
+        AppLogger.log("❌ [$subdirName] 导入失败: $e", isError: true);
+        setState(() {
+          subdir['status'] = '❌ 失败';
+        });
+      }
+    }
+    
+    // 更新项目的话题计数
+    final updatedProject = KnowledgeProject(
+      id: projectId,
+      name: _projectNameCtrl.text.trim().isNotEmpty ? _projectNameCtrl.text.trim() : path.basename(_rootPath!),
+      rootPath: _rootPath!,
+      topicCount: _importedCount,
+      createdAt: project.createdAt,
+    );
+    await DatabaseHelper.updateProject(updatedProject);
+    
+    if (mounted) {
+      setState(() {
+        _isImporting = false;
+        _currentStatus = "导入完成：$_importedCount/${_totalSelected} 个子话题导入成功";
+      });
+      AppLogger.log("🎉 项目导入完成！$_importedCount/${_totalSelected} 个子话题已导入");
+    }
+  }
+
+  // 辅助：读取文本文件
+  Future<String> _readTextFile(String filePath) async {
+    try {
+      return await io.File(filePath).readAsString();
+    } catch (e) {
+      try {
+        final encRes = await io.Process.run('file', ['-b', '--mime-encoding', filePath]);
+        final charset = encRes.stdout.toString().trim();
+        if (charset.isNotEmpty && charset != 'binary') {
+          final iconvRes = await io.Process.run('iconv', ['-f', charset, '-t', 'utf-8', filePath]);
+          if (iconvRes.exitCode == 0) return iconvRes.stdout.toString();
+        }
+      } catch (_) {}
+      return "\n[文件解码失败]";
+    }
+  }
+
+  // 辅助：解析 Word 文档
+  Future<String> _parseWordDoc(String filePath, String ext) async {
+    try {
+      final escapedPath = filePath.replaceAll("'", "'\\''");
+      if (ext == '.docx') {
+        final res = await io.Process.run('sh', ['-c', "unzip -p '$escapedPath' word/document.xml | sed -e 's/<[^>]*>//g'"]);
+        if (res.exitCode == 0) return res.stdout.toString();
+      } else if (ext == '.doc') {
+        var res = await io.Process.run('catdoc', [filePath]);
+        if (res.exitCode == 0 && res.stdout.toString().trim().isNotEmpty) return res.stdout.toString();
+        res = await io.Process.run('antiword', [filePath]);
+        if (res.exitCode == 0 && res.stdout.toString().trim().isNotEmpty) return res.stdout.toString();
+      }
+    } catch (_) {}
+    return "\n[Word 解析失败]";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedCount = _subdirs.where((d) => d['checked']).length;
+    
+    return Scaffold(
+      appBar: AppBar(title: const Text("导入项目目录")),
+      body: Column(
+        children: [
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // 根目录选择
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _projectNameCtrl,
+                          decoration: const InputDecoration(
+                            labelText: "项目名称",
+                            border: OutlineInputBorder(),
+                            hintText: "自动从目录名获取",
+                          ),
+                          enabled: !_isImporting,
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      FilledButton.icon(
+                        icon: _isScanning
+                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.folder_open),
+                        label: Text(_rootPath == null ? "选择根目录" : "重新选择"),
+                        onPressed: (_isScanning || _isImporting) ? null : _pickRootDirectory,
+                      ),
+                    ],
+                  ),
+                  
+                  if (_rootPath != null) ...[
+                    const SizedBox(height: 8),
+                    Text("根目录: $_rootPath", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                  ],
+                  
+                  const SizedBox(height: 24),
+                  
+                  // 子目录列表
+                  if (_subdirs.isNotEmpty) ...[
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text("子话题列表 (${_subdirs.length} 个)", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                        Row(
+                          children: [
+                            TextButton(
+                              onPressed: _isImporting ? null : () {
+                                setState(() => _subdirs.forEach((d) => d['checked'] = true));
+                              },
+                              child: const Text("全选"),
+                            ),
+                            TextButton(
+                              onPressed: _isImporting ? null : () {
+                                setState(() => _subdirs.forEach((d) => d['checked'] = false));
+                              },
+                              child: const Text("全不选"),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    SwitchListTile(
+                      title: const Text("导入后自动构建向量索引"),
+                      subtitle: const Text("开启后将立即为每个子话题生成 Embedding 向量，便于后续问答检索"),
+                      value: _useEmbedding,
+                      onChanged: _isImporting ? null : (v) => setState(() => _useEmbedding = v),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                    const SizedBox(height: 8),
+                    ..._subdirs.map((subdir) {
+                      return CheckboxListTile(
+                        title: Text(subdir['name'] as String),
+                        subtitle: Text(subdir['hasFiles'] ? "包含支持文件" : "无支持文件",
+                            style: TextStyle(color: subdir['hasFiles'] ? Colors.green : Colors.grey)),
+                        value: subdir['checked'] as bool,
+                        onChanged: _isImporting ? null : (v) => setState(() => subdir['checked'] = v),
+                        secondary: Text(subdir['status'] as String, style: const TextStyle(fontSize: 12)),
+                        dense: true,
+                      );
+                    }).toList(),
+                  ],
+                  
+                  if (_subdirs.isEmpty && _rootPath != null && !_isScanning) ...[
+                    const Center(child: Padding(
+                      padding: EdgeInsets.all(32),
+                      child: Text("该目录下未找到含支持文件的子目录", style: TextStyle(color: Colors.grey)),
+                    )),
+                  ],
+                  
+                  const SizedBox(height: 32),
+                  
+                  // 导入按钮
+                  if (_rootPath != null && _subdirs.isNotEmpty)
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: FilledButton.icon(
+                        icon: _isImporting
+                            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.download),
+                        label: Text(
+                          _isImporting
+                              ? _currentStatus
+                              : "开始导入 (已选 $selectedCount 个子话题)",
+                          style: const TextStyle(fontSize: 16),
+                        ),
+                        onPressed: (_isImporting || selectedCount == 0) ? null : _startImport,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          
+          // 日志面板
+          Container(
+            height: 200,
+            width: double.infinity,
+            color: const Color(0xFF1E1E1E),
+            padding: const EdgeInsets.all(8),
+            child: ListView.builder(
+              controller: _logScrollController,
+              itemCount: _logLines.length,
+              itemBuilder: (context, index) {
+                final line = _logLines[index];
+                Color textColor = Colors.white70;
+                if (line.contains("[ERROR]")) textColor = Colors.redAccent;
+                else if (line.contains("✅")) textColor = Colors.greenAccent;
+                else if (line.contains("📥")) textColor = Colors.cyanAccent;
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text(line, style: TextStyle(color: textColor, fontFamily: 'monospace', fontSize: 11)),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ==========================================
+// [新增] 项目详情界面 - 展示项目下的所有子话题
+// ==========================================
+class ProjectDetailScreen extends StatefulWidget {
+  final KnowledgeProject project;
+  const ProjectDetailScreen({super.key, required this.project});
+
+  @override
+  State<ProjectDetailScreen> createState() => _ProjectDetailScreenState();
+}
+
+class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
+  List<SavedExam> _topics = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTopics();
+  }
+
+  Future<void> _loadTopics() async {
+    final topics = await DatabaseHelper.getExamsByProject(widget.project.id!);
+    if (mounted) setState(() { _topics = topics; _isLoading = false; });
+  }
+
+  Future<void> _rescanDirectory() async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("正在重新扫描目录...")));
+    
+    try {
+      final rootDir = io.Directory(widget.project.rootPath);
+      if (!await rootDir.exists()) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ 原目录已不存在")));
+        return;
+      }
+      
+      final existingPaths = _topics.map((t) => t.sourcePath ?? '').toSet();
+      final validExts = ['.txt', '.md', '.json', '.csv', '.png', '.jpg', '.jpeg', '.pdf', '.doc', '.docx', '.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'];
+      
+      int newCount = 0;
+      await for (final entity in rootDir.list()) {
+        if (entity is io.Directory) {
+          final dirPath = entity.path;
+          if (existingPaths.contains(dirPath)) continue;
+          
+          // Check for supported files
+          bool hasFiles = false;
+          await for (final f in entity.list(recursive: true, followLinks: false)) {
+            if (f is io.File && validExts.contains(path.extension(f.path).toLowerCase())) {
+              hasFiles = true;
+              break;
+            }
+          }
+          if (!hasFiles) continue;
+          
+          // Import new topic
+          final homeDir = io.Platform.environment['HOME'] ?? '.';
+          final chunksDir = '$homeDir/.ai_teacher/chunks/proj_rescan_${DateTime.now().millisecondsSinceEpoch}_$newCount';
+          final store = ChunkedKnowledgeStore(chunksDir);
+          
+          await for (final f in entity.list(recursive: true, followLinks: false)) {
+            if (f is io.File) {
+              final ext = path.extension(f.path).toLowerCase();
+              if (!validExts.contains(ext)) continue;
+              try {
+                String content = "";
+                if (['.png', '.jpg', '.jpeg'].contains(ext) || ext == '.pdf') {
+                  content = await DualAIService.performLocalOCR(f.path);
+                } else {
+                  try {
+                    content = await io.File(f.path).readAsString();
+                  } catch (_) {}
+                }
+                if (content.isNotEmpty) {
+                  await store.append("\n--- ${path.basename(f.path)} ---\n$content");
+                }
+              } catch (_) {}
+            }
+          }
+          
+          final fullText = await store.readAll();
+          store.dispose();
+          
+          if (fullText.trim().isNotEmpty) {
+            final exam = SavedExam(
+              title: path.basename(entity.path),
+              examJson: "[]",
+              knowledgeBase: fullText,
+              createdAt: DateTime.now().millisecondsSinceEpoch,
+              projectId: widget.project.id,
+              sourcePath: dirPath,
+            );
+            await DatabaseHelper.saveExam(exam);
+            newCount++;
+          }
+        }
+      }
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ 扫描完成，新增 $newCount 个子话题")));
+        _loadTopics();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ 扫描失败: $e")));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("项目: ${widget.project.name}"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.teal),
+            tooltip: "重新扫描目录（增量导入新子目录）",
+            onPressed: _rescanDirectory,
+          ),
+          IconButton(
+            icon: const Icon(Icons.question_answer, color: Colors.purple),
+            tooltip: "跨话题问答",
+            onPressed: () {
+              if (_topics.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("暂无子话题可问答")));
+                return;
+              }
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => ProjectChatScreen(
+                  project: widget.project,
+                  topics: _topics,
+                )),
+              );
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete, color: Colors.redAccent),
+            tooltip: "删除整个项目",
+            onPressed: () async {
+              final confirm = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text("确认删除项目"),
+                  content: Text("将删除项目「${widget.project.name}」及其所有子话题（共 ${_topics.length} 个），此操作不可撤销。"),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("取消")),
+                    FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text("确认删除", style: TextStyle(color: Colors.white)),
+                      style: FilledButton.styleFrom(backgroundColor: Colors.red)),
+                  ],
+                ),
+              );
+              if (confirm == true && mounted) {
+                await DatabaseHelper.deleteProjectCascade(widget.project.id!);
+                if (mounted) Navigator.pop(context);
+              }
+            },
+          ),
+        ],
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : _topics.isEmpty
+              ? const Center(child: Text("该项目暂无子话题"))
+              : RefreshIndicator(
+                  onRefresh: _loadTopics,
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: _topics.length,
+                    itemBuilder: (context, index) {
+                      final topic = _topics[index];
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        child: ListTile(
+                          leading: CircleAvatar(child: Text("${index + 1}")),
+                          title: Text(topic.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Text("题量: ${topic.parsedQuestions.length} | ${(topic.knowledgeBase.length / 1000).toStringAsFixed(1)}K 文本"),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.question_answer, color: Colors.purple),
+                                tooltip: "知识库问答",
+                                onPressed: () {
+                                  if (topic.knowledgeBase.isEmpty) return;
+                                  Navigator.push(context, MaterialPageRoute(builder: (_) => ChatWithKnowledgeScreen(exam: topic)));
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.storage, color: Colors.orange),
+                                tooltip: "构建向量索引",
+                                onPressed: () async {
+                                  if (topic.knowledgeBase.isEmpty) return;
+                                  await SemanticRetrievalService.buildAndSaveIndex(topic.id!, topic.knowledgeBase);
+                                  if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 向量索引构建完成")));
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.list_alt, color: Colors.teal),
+                                tooltip: "管理题目",
+                                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamQuestionManagerScreen(exam: topic))),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.edit_document, color: Colors.teal),
+                                tooltip: "编辑知识库",
+                                onPressed: () {
+                                  if (topic.knowledgeBase.isEmpty) return;
+                                  Navigator.push(context, MaterialPageRoute(builder: (_) => KnowledgeInputScreen(existingExam: topic)));
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.history),
+                                tooltip: "答题记录",
+                                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ExamHistoryScreen(exam: topic))),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.auto_awesome, color: Colors.indigo),
+                                tooltip: "生成考题",
+                                onPressed: () {
+                                  showDialog(
+                                    context: context,
+                                    builder: (ctx) => _RegenerateExamDialog(
+                                      exam: topic,
+                                      onStart: (topicName, count, difficulty, useEmbedding) async {
+                                        Navigator.pop(ctx);
+                                        final provider = context.read<ExamProvider>();
+                                        await provider.processAndGenerate(
+                                          rawText: topic.knowledgeBase,
+                                          topic: topicName,
+                                          count: count,
+                                          difficulty: difficulty,
+                                          useEmbedding: useEmbedding,
+                                        );
+                                        _loadTopics();
+                                      },
+                                    ),
+                                  );
+                                },
+                              ),
+                            ],
+                          ),
+                          onTap: () {
+                            context.read<ExamTakingProvider>().startExam(topic);
+                            Navigator.push(context, MaterialPageRoute(builder: (_) => ExamTakingScreen(exam: topic)));
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
+    );
+  }
+}
+
+// ==========================================
+// [新增] 跨话题问答界面
+// ==========================================
+class ProjectChatScreen extends StatefulWidget {
+  final KnowledgeProject project;
+  final List<SavedExam> topics;
+  const ProjectChatScreen({super.key, required this.project, required this.topics});
+
+  @override
+  State<ProjectChatScreen> createState() => _ProjectChatScreenState();
+}
+
+class _ProjectChatScreenState extends State<ProjectChatScreen> {
+  final List<Map<String, dynamic>> _messages = [];
+  final TextEditingController _chatController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  bool _isReplying = false;
+
+  // topicId -> topic title 映射
+  late Map<int, String> _topicNames;
+
+  @override
+  void initState() {
+    super.initState();
+    _topicNames = {for (var t in widget.topics) t.id!: t.title};
+    _messages.add({
+      'role': 'ai',
+      'text': "您好！我已学习了项目 **【${widget.project.name}】** 下的 ${widget.topics.length} 个子话题。"
+          "您可以向我提问，我将跨话题检索相关知识为您解答。"
+    });
+  }
+
+  void _scrollToBottom() {
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  Future<void> _sendMessage() async {
+    final text = _chatController.text.trim();
+    if (text.isEmpty || _isReplying) return;
+
+    setState(() {
+      _messages.add({'role': 'user', 'text': text});
+      _isReplying = true;
+      _chatController.clear();
+    });
+    _scrollToBottom();
+
+    try {
+      final examIds = widget.topics.where((t) => t.id != null).map((t) => t.id!).toList();
+      final embeddingModel = await ConfigService.getEmbeddingModel();
+      
+      String relevantContext = "";
+      List<Map<String, dynamic>> retrievedWithSource = [];
+
+      if (embeddingModel.isNotEmpty && examIds.isNotEmpty) {
+        AppLogger.log("🔍 跨话题检索: ${examIds.length} 个子话题");
+        retrievedWithSource = await SemanticRetrievalService.searchContextMultiple(examIds, text);
+        
+        if (retrievedWithSource.isNotEmpty) {
+          // 组装带来源标记的上下文
+          final contextParts = retrievedWithSource.map((item) {
+            final chunkText = item['chunkText'] as String;
+            final examId = item['examId'] as int;
+            final topicName = _topicNames[examId] ?? '未知话题';
+            return "[话题: $topicName]\n$chunkText";
+          }).toList();
+          relevantContext = contextParts.join("\n\n");
+        }
+      }
+
+      String aiResponse = await DualAIService.answerQuestionWithContext(text, relevantContext);
+
+      if (mounted) {
+        setState(() {
+          _messages.add({
+            'role': 'ai',
+            'text': aiResponse,
+            'sourceInfo': retrievedWithSource.map((item) {
+              final examId = item['examId'] as int;
+              return {
+                'topicName': _topicNames[examId] ?? '未知话题',
+                'text': item['chunkText'] as String,
+              };
+            }).toList(),
+          });
+          _isReplying = false;
+        });
+        _scrollToBottom();
+      }
+    } catch (e) {
+      AppLogger.log("跨话题问答异常: $e", isError: true);
+      if (mounted) {
+        setState(() {
+          _messages.add({'role': 'ai', 'text': "请求异常: $e"});
+          _isReplying = false;
+        });
+        _scrollToBottom();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text("跨话题探讨: ${widget.project.name}"),
+            Text("${widget.topics.length} 个子话题", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.normal)),
+          ],
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollController,
+              padding: const EdgeInsets.all(16),
+              itemCount: _messages.length,
+              itemBuilder: (context, index) {
+                final msg = _messages[index];
+                final isUser = msg['role'] == 'user';
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 24),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+                    children: [
+                      if (!isUser) ...[
+                        const CircleAvatar(backgroundColor: Colors.indigo, child: Icon(Icons.smart_toy, color: Colors.white, size: 20)),
+                        const SizedBox(width: 12),
+                      ],
+                      Flexible(
+                        child: Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: isUser ? Theme.of(context).colorScheme.primaryContainer : Theme.of(context).colorScheme.surfaceVariant,
+                            borderRadius: BorderRadius.only(
+                              topLeft: const Radius.circular(16),
+                              topRight: const Radius.circular(16),
+                              bottomLeft: Radius.circular(isUser ? 16 : 0),
+                              bottomRight: Radius.circular(isUser ? 0 : 16),
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _renderMarkdown(msg['text'] as String, isSelectable: true, shrinkWrap: true),
+                              if (msg['sourceInfo'] != null && (msg['sourceInfo'] as List).isNotEmpty) ...[
+                                const SizedBox(height: 12),
+                                Theme(
+                                  data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                                  child: ExpansionTile(
+                                    tilePadding: EdgeInsets.zero,
+                                    title: Text(
+                                      "🔍 共参考 ${(msg['sourceInfo'] as List).length} 个向量片段",
+                                      style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary),
+                                    ),
+                                    children: (msg['sourceInfo'] as List).map((info) {
+                                      return Container(
+                                        margin: const EdgeInsets.only(bottom: 8),
+                                        padding: const EdgeInsets.all(8),
+                                        decoration: BoxDecoration(
+                                          color: Theme.of(context).colorScheme.surface,
+                                          border: Border.all(color: Colors.grey.withOpacity(0.3)),
+                                          borderRadius: BorderRadius.circular(6),
+                                        ),
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text("📂 ${info['topicName']}",
+                                                style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.indigo)),
+                                            const SizedBox(height: 4),
+                                            SelectableText(info['text'] as String,
+                                                style: const TextStyle(fontSize: 11, fontStyle: FontStyle.italic)),
+                                          ],
+                                        ),
+                                      );
+                                    }).toList(),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                      ),
+                      if (isUser) ...[
+                        const SizedBox(width: 12),
+                        CircleAvatar(backgroundColor: Colors.grey.shade400, child: const Icon(Icons.person, color: Colors.white, size: 20)),
+                      ],
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          if (_isReplying)
+            const Padding(padding: EdgeInsets.all(8.0), child: Text("正在跨话题检索并思考...", style: TextStyle(color: Colors.grey, fontStyle: FontStyle.italic))),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _chatController,
+                    maxLines: 4, minLines: 1,
+                    decoration: const InputDecoration(hintText: "跨话题提问...", border: OutlineInputBorder()),
+                    onSubmitted: (_) => _sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _isReplying ? null : _sendMessage,
+                  style: FilledButton.styleFrom(shape: const CircleBorder(), padding: const EdgeInsets.all(16)),
+                  child: const Icon(Icons.send),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ==========================================
 // 视图层 - 配置与设置界面 (全矩阵动态渲染版)
 // ==========================================
 class SettingsScreen extends StatefulWidget {
@@ -4723,19 +5938,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ],
                         ),
                         const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            const Expanded(flex: 2, child: Text("切割份数：")),
-                            Expanded(
-                              flex: 3,
-                              child: DropdownButtonFormField<int>(
-                                value: _imageSplitHorizontalParts.clamp(2, 6),
-                                decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
-                                items: [2, 3, 4, 5, 6].map((e) => DropdownMenuItem(value: e, child: Text("$e 份"))).toList(),
-                                onChanged: (v) => setState(() => _imageSplitHorizontalParts = v!),
-                              ),
-                            ),
-                          ],
+                        // [修改] 切割份数由系统根据阈值自动计算，不再需要用户手动设置
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          child: Row(
+                            children: const [
+                              Icon(Icons.info_outline, size: 16, color: Colors.blueGrey),
+                              SizedBox(width: 8),
+                              Expanded(child: Text("切割份数由系统根据阈值自动计算，每份不超过设定高度/宽度", style: TextStyle(fontSize: 12, color: Colors.blueGrey))),
+                            ],
+                          ),
                         ),
                         const SizedBox(height: 16),
 
@@ -4761,19 +5973,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ],
                         ),
                         const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            const Expanded(flex: 2, child: Text("切割份数：")),
-                            Expanded(
-                              flex: 3,
-                              child: DropdownButtonFormField<int>(
-                                value: _imageSplitVerticalParts.clamp(2, 6),
-                                decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
-                                items: [2, 3, 4, 5, 6].map((e) => DropdownMenuItem(value: e, child: Text("$e 份"))).toList(),
-                                onChanged: (v) => setState(() => _imageSplitVerticalParts = v!),
-                              ),
-                            ),
-                          ],
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          child: Row(
+                            children: const [
+                              Icon(Icons.info_outline, size: 16, color: Colors.blueGrey),
+                              SizedBox(width: 8),
+                              Expanded(child: Text("切割份数由系统根据阈值自动计算，每份不超过设定宽度", style: TextStyle(fontSize: 12, color: Colors.blueGrey))),
+                            ],
+                          ),
                         ),
                         const SizedBox(height: 12),
                         Container(
@@ -4790,8 +5998,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               SizedBox(width: 8),
                               Expanded(
                                 child: Text(
-                                  "提示：智能切割功能会寻找图片中的空白行/列作为自然分割点，并在切割处保留10%重叠区域，最大程度避免文本被切断。"
-                                  "若切割后仍发现文字被截断，可尝试增大切割份数或降低阈值。",
+                                  "提示：系统采用动态阈值切割，每份不超过设定的高度/宽度阈值。智能切割会寻找空白行/列作为自然分割点，"
+                                  "并在切割处保留10%重叠区域，最大程度避免文本被切断。可降低高度阈值以得到更小的切片。",
                                   style: TextStyle(fontSize: 12, color: Colors.amber),
                                 ),
                               ),
@@ -5071,7 +6279,6 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
           if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
             if (_visionMode == 'auto' || _visionMode == 'ocr') {
               content = await DualAIService.performLocalOCR(filePath);
-              content = await DualAIService.fixOcrText(content);
             } else {
               content = "[图片文件，多模态模型已禁用]";
             }
@@ -5079,15 +6286,12 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
             if (_visionMode == 'auto' || _visionMode == 'ocr') {
               if (_ocrEngine == 'native' && io.Platform.isLinux) {
                 try { 
-                  content = await _parsePdfWithOCR(filePath); 
-                  content = await DualAIService.fixOcrText(content);
+                  content = await _parsePdfWithOCR(filePath);
                 } catch (e) { 
                   content = await DualAIService.performLocalOCR(filePath);
-                  content = await DualAIService.fixOcrText(content);
                 }
               } else {
                 content = await DualAIService.performLocalOCR(filePath);
-                content = await DualAIService.fixOcrText(content);
               }
             } else {
               content = "[PDF 文件，多模态模型已禁用]";
