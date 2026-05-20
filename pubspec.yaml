@@ -47,6 +47,9 @@ dependencies:
   image_picker: ^1.1.2
   #pdfx: ^2.6.0
   
+  # Image processing for smart image splitting
+  image: ^4.5.3
+  
   # Markdown and LaTeX rendering
   flutter_markdown_plus: ^1.0.7
   flutter_markdown_plus_latex: ^1.0.5

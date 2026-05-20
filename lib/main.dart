@@ -6,7 +6,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:math' as math; // 用于处理向量相似度计算中的数学函数
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img_lib;
 import 'package:flutter/services.dart'; // 用于粘贴板复制功能
 import 'package:provider/provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -748,6 +750,57 @@ class ConfigService {
   static Future<void> saveEmbeddingModel(String model) async {
     await setConfigString('embedding_local_model', model);
   }
+
+  // ==========================================
+  // 图片智能切割配置
+  // ==========================================
+  static Future<bool> getImageSplitEnabled() async {
+    final val = await getConfigString(ImageSplitService.KEY_ENABLED, 'true');
+    return val.toLowerCase() == 'true';
+  }
+  static Future<void> setImageSplitEnabled(bool enabled) async {
+    await setConfigString(ImageSplitService.KEY_ENABLED, enabled.toString());
+  }
+
+  static Future<int> getImageSplitMaxHeight() async {
+    final val = await getConfigString(ImageSplitService.KEY_MAX_HEIGHT, '${ImageSplitService.DEFAULT_MAX_HEIGHT}');
+    return int.tryParse(val) ?? ImageSplitService.DEFAULT_MAX_HEIGHT;
+  }
+  static Future<void> setImageSplitMaxHeight(int height) async {
+    await setConfigString(ImageSplitService.KEY_MAX_HEIGHT, height.toString());
+  }
+
+  static Future<int> getImageSplitMaxWidth() async {
+    final val = await getConfigString(ImageSplitService.KEY_MAX_WIDTH, '${ImageSplitService.DEFAULT_MAX_WIDTH}');
+    return int.tryParse(val) ?? ImageSplitService.DEFAULT_MAX_WIDTH;
+  }
+  static Future<void> setImageSplitMaxWidth(int width) async {
+    await setConfigString(ImageSplitService.KEY_MAX_WIDTH, width.toString());
+  }
+
+  static Future<bool> getImageSplitSmart() async {
+    final val = await getConfigString(ImageSplitService.KEY_SMART_SPLIT, 'true');
+    return val.toLowerCase() == 'true';
+  }
+  static Future<void> setImageSplitSmart(bool smart) async {
+    await setConfigString(ImageSplitService.KEY_SMART_SPLIT, smart.toString());
+  }
+
+  static Future<int> getImageSplitHorizontalParts() async {
+    final val = await getConfigString(ImageSplitService.KEY_HORIZONTAL_PARTS, '${ImageSplitService.DEFAULT_HORIZONTAL_PARTS}');
+    return int.tryParse(val) ?? ImageSplitService.DEFAULT_HORIZONTAL_PARTS;
+  }
+  static Future<void> setImageSplitHorizontalParts(int parts) async {
+    await setConfigString(ImageSplitService.KEY_HORIZONTAL_PARTS, parts.toString());
+  }
+
+  static Future<int> getImageSplitVerticalParts() async {
+    final val = await getConfigString(ImageSplitService.KEY_VERTICAL_PARTS, '${ImageSplitService.DEFAULT_VERTICAL_PARTS}');
+    return int.tryParse(val) ?? ImageSplitService.DEFAULT_VERTICAL_PARTS;
+  }
+  static Future<void> setImageSplitVerticalParts(int parts) async {
+    await setConfigString(ImageSplitService.KEY_VERTICAL_PARTS, parts.toString());
+  }
 }
 
 // ==========================================
@@ -1194,16 +1247,52 @@ class DualAIService {
     }
   }
 
-  /// [修改] 视觉模型 OCR 接入动态网关 (保留原方法名避免调用层报错)
+  /// [修改] 视觉模型 OCR 接入动态网关，集成图片智能切割功能
+  /// 自动将超高/超宽图片分割后分别识别，再将结果合并
   static Future<String> performLocalOCR(String filePath, {int maxRetries = 3}) async {
     final engineCtx = await _buildEngineContext(taskType: 'vision');
     if ((engineCtx["model"] as String).isEmpty) return "[未配置视觉模型]";
 
     AppLogger.log("触发视觉处理模型 [${engineCtx["model"]}]，正在解析: ${path.basename(filePath)}");
 
-    final bytes = await io.File(filePath).readAsBytes();
+    // [新增] 使用 ImageSplitService 进行智能切割
+    final parts = await ImageSplitService.splitImage(filePath);
+    
+    if (parts.length == 1) {
+      // 无需切割，直接走原始流程
+      final bytes = parts.first['bytes'] as Uint8List;
+      return await _performSingleOCR(bytes, path.basename(filePath), engineCtx, maxRetries);
+    }
+
+    // 需要切割：逐部分识别并合并结果
+    AppLogger.log("🔀 图片已切割为 ${parts.length} 份，开始逐份识别...");
+    final List<String> partResults = [];
+    for (int i = 0; i < parts.length; i++) {
+      final partBytes = parts[i]['bytes'] as Uint8List;
+      final partLabel = parts[i]['label'] as String;
+      
+      AppLogger.log("  📝 正在识别第 ${i + 1}/${parts.length} 份 ($partLabel)...");
+      final partText = await _performSingleOCR(partBytes, "${path.basename(filePath)}[$partLabel]", engineCtx, maxRetries);
+      partResults.add("\n===== 图片${partLabel}识别结果 =====\n$partText");
+      
+      // 份间延迟避免触发频率限制
+      if (i < parts.length - 1) await Future.delayed(const Duration(seconds: 2));
+    }
+    
+    final combinedResult = partResults.join("\n\n");
+    AppLogger.log("✅ 切割识别完成，共 ${parts.length} 份，已合并为最终结果");
+    return combinedResult;
+  }
+
+  /// 执行单张图片的 OCR 识别（内部方法）
+  static Future<String> _performSingleOCR(Uint8List bytes, String fileLabel, Map<String, dynamic> engineCtx, int maxRetries) async {
     final base64Img = base64Encode(bytes);
-    final mimeType = path.extension(filePath).toLowerCase() == '.png' ? 'image/png' : 'image/jpeg';
+    final mimeType = 'image/png';
+    
+    // [诊断] 记录图片大小信息
+    final imgSizeKB = (bytes.length / 1024).toStringAsFixed(1);
+    final base64Len = base64Img.length;
+    AppLogger.log("📏 [$fileLabel] 尺寸: ${imgSizeKB}KB, Base64长度: ${base64Len}字符");
 
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -1219,14 +1308,27 @@ class DualAIService {
             "messages":[{"role": "user", "content":[{"type": "text", "text": "提取图片中的所有文本信息,但是也请描述图片内容,特别是示意图，如果遇到表格，请输出表格内容,请直接输出信息，不需要包含过多的格式。"},{"type": "image_url", "image_url": {"url": "data:$mimeType;base64,$base64Img"}}]}]
           },
         );
-        if (response.statusCode != 200) throw Exception("HTTP ${response.statusCode}: ${response.data}");
+        if (response.statusCode != 200) {
+          // [诊断] 记录完整的错误响应体
+          AppLogger.log("❌ HTTP ${response.statusCode}: ${response.data}", isError: true);
+          throw Exception("HTTP ${response.statusCode}: ${response.data}");
+        }
         
         final usage = response.data['usage'];
-        AppLogger.log("视觉解析成功: ${path.basename(filePath)} [消耗 Tokens: ${usage?['completion_tokens']}]");
+        AppLogger.log("视觉解析成功: $fileLabel [消耗 Tokens: ${usage?['completion_tokens']}]");
         return response.data['choices'][0]['message']['content'];
       } catch (e) {
-        AppLogger.log("OCR 第 $attempt 次尝试失败: $e", isError: true);
-        if (attempt == maxRetries) throw Exception("视觉服务重试耗尽");
+        final errDetail = e.toString();
+        // [诊断] 记录详细的异常信息
+        AppLogger.log("OCR 第 $attempt 次尝试失败 ($fileLabel): $errDetail", isError: true);
+        // [诊断] 如果是 DioException，尝试提取响应体
+        if (e is DioException && e.response != null) {
+          AppLogger.log("📋 HTTP错误详情: 状态码=${e.response!.statusCode}, 响应体=${e.response!.data}", isError: true);
+        }
+        if (attempt == maxRetries) {
+          AppLogger.log("❌ OCR 重试 $maxRetries 次全部失败，异常信息: $errDetail", isError: true);
+          throw Exception("视觉服务重试耗尽: $errDetail");
+        }
         await Future.delayed(Duration(seconds: attempt * 2));
       }
     }
@@ -1544,6 +1646,53 @@ ${jsonEncode(draft.toJson())}
       }
     }
     return "";
+  }
+
+  /// [修复] 调用聊天模型（而非视觉模型）对 OCR 文本进行修正纠错
+  /// 纯文本纠错任务不应路由到视觉模型，防止视觉模型拒绝文本-only 请求
+  static Future<String> fixOcrText(String rawText, {int maxRetries = 2}) async {
+    if (rawText.trim().isEmpty) return rawText;
+    final engineCtx = await _buildEngineContext(taskType: 'chat');
+    if ((engineCtx["model"] as String).isEmpty) return rawText;
+
+    final prompt = """
+你是一个专业的OCR文本纠错助手。请对以下OCR识别结果进行修正：
+1. 修正明显的错别字和乱码
+2. 保持原文的格式、换行和分段
+3. 不要删除或添加原文不包含的内容
+4. 如果原文已经是正确的中文文本，直接原样返回
+5. 直接返回修正后的文本，不要添加任何解释
+
+OCR文本：
+$rawText
+""";
+
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final response = await _dio.post(
+          engineCtx["url"],
+          options: Options(
+            headers: {"Authorization": "Bearer ${engineCtx["key"]}", "Content-Type": "application/json"},
+            receiveTimeout: const Duration(minutes: 5),
+            validateStatus: (s) => s != null && s < 600
+          ),
+          data: {
+            "model": engineCtx["model"],
+            "messages":[{"role": "user", "content": prompt}]
+          },
+        );
+        if (response.statusCode != 200) throw Exception("HTTP ${response.statusCode}: ${response.data}");
+        return response.data['choices'][0]['message']['content'].toString().trim();
+      } catch (e) {
+        AppLogger.log("OCR修正第 $attempt 次尝试失败: $e", isError: true);
+        if (attempt == maxRetries) {
+          AppLogger.log("OCR修正重试耗尽，返回原始文本", isError: true);
+          return rawText;
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
+    }
+    return rawText;
   }
 }
 
@@ -2833,6 +2982,379 @@ class _ExamHistoryScreenState extends State<ExamHistoryScreen> {
   }
 }
 
+// ==========================================
+// [新增] 图片智能切割服务 — 针对超高/超宽单页图片进行分割，
+// 支持横向切割（上下分）和纵向切割（左右分），
+// 并具备智能防伤文本的空白行探测功能。
+// ==========================================
+class ImageSplitService {
+  /// 配置键名
+  static const String KEY_ENABLED = 'image_split_enabled';
+  static const String KEY_MAX_HEIGHT = 'image_split_max_height';
+  static const String KEY_MAX_WIDTH = 'image_split_max_width';
+  static const String KEY_SMART_SPLIT = 'image_split_smart';
+  static const String KEY_HORIZONTAL_PARTS = 'image_split_horizontal_parts';
+  static const String KEY_VERTICAL_PARTS = 'image_split_vertical_parts';
+
+  /// 默认值
+  static const int DEFAULT_MAX_HEIGHT = 2000;
+  static const int DEFAULT_MAX_WIDTH = 2000;
+  static const int DEFAULT_HORIZONTAL_PARTS = 2;
+  static const int DEFAULT_VERTICAL_PARTS = 2;
+
+  /// 是否启用图片切割
+  static Future<bool> isEnabled() async {
+    final val = await ConfigService.getConfigString(KEY_ENABLED, 'true');
+    return val.toLowerCase() == 'true';
+  }
+
+  /// 获取最大高度阈值（超过则横向切割/上下分）
+  static Future<int> getMaxHeight() async {
+    final val = await ConfigService.getConfigString(KEY_MAX_HEIGHT, '$DEFAULT_MAX_HEIGHT');
+    return int.tryParse(val) ?? DEFAULT_MAX_HEIGHT;
+  }
+
+  /// 获取最大宽度阈值（超过则纵向切割/左右分）
+  static Future<int> getMaxWidth() async {
+    final val = await ConfigService.getConfigString(KEY_MAX_WIDTH, '$DEFAULT_MAX_WIDTH');
+    return int.tryParse(val) ?? DEFAULT_MAX_WIDTH;
+  }
+
+  /// 是否启用智能切割（防伤文本）
+  static Future<bool> isSmartSplitEnabled() async {
+    final val = await ConfigService.getConfigString(KEY_SMART_SPLIT, 'true');
+    return val.toLowerCase() == 'true';
+  }
+
+  /// 获取横向切割份数
+  static Future<int> getHorizontalParts() async {
+    final val = await ConfigService.getConfigString(KEY_HORIZONTAL_PARTS, '$DEFAULT_HORIZONTAL_PARTS');
+    return int.tryParse(val) ?? DEFAULT_HORIZONTAL_PARTS;
+  }
+
+  /// 获取纵向切割份数
+  static Future<int> getVerticalParts() async {
+    final val = await ConfigService.getConfigString(KEY_VERTICAL_PARTS, '$DEFAULT_VERTICAL_PARTS');
+    return int.tryParse(val) ?? DEFAULT_VERTICAL_PARTS;
+  }
+
+  /// 检查是否需要切割，并返回切割后的图片字节列表。
+  /// 返回结构：List<Map>，每项含 {bytes, label}，label 用于标记位置。
+  static Future<List<Map<String, dynamic>>> splitImage(String filePath) async {
+    final bytes = await io.File(filePath).readAsBytes();
+    final original = [{
+      'bytes': bytes,
+      'label': '整图',
+    }];
+
+    if (!await isEnabled()) return original;
+
+    final img = img_lib.decodeImage(bytes);
+    if (img == null) return original;
+
+    final maxHeight = await getMaxHeight();
+    final maxWidth = await getMaxWidth();
+    final smartSplit = await isSmartSplitEnabled();
+    final hParts = await getHorizontalParts();
+    final vParts = await getVerticalParts();
+
+    AppLogger.log("📐 图片尺寸: ${img.width}x${img.height}, 阈值: ${maxWidth}x${maxHeight}");
+
+    final List<Map<String, dynamic>> result = [];
+
+    // 先检查高度是否超过阈值 — 横向切割（上下分）
+    if (img.height > maxHeight && hParts > 1) {
+      final partHeight = (img.height / hParts).ceil();
+      AppLogger.log("✂️ 图片高度(${img.height}px)超过阈值(${maxHeight}px)，执行横向切割为 $hParts 份");
+
+      for (int i = 0; i < hParts; i++) {
+        int yStart = i * partHeight;
+        int yEnd = (i == hParts - 1) ? img.height : (i + 1) * partHeight;
+
+        // 智能切割：寻找自然分割线（空白行）
+        if (smartSplit) {
+          if (i > 0) {
+            yStart = _findBestSplitY(img, yStart, partHeight ~/ 4);
+          }
+          if (i < hParts - 1) {
+            yEnd = _findBestSplitY(img, yEnd, partHeight ~/ 4);
+          }
+          // 应用10%重叠区域，确保边界文本完整
+          if (i > 0) yStart = (yStart - (partHeight * 0.05).round()).clamp(0, img.height - 1);
+          if (i < hParts - 1) yEnd = (yEnd + (partHeight * 0.05).round()).clamp(0, img.height);
+        }
+
+        final part = img_lib.copyCrop(img, x: 0, y: yStart, width: img.width, height: (yEnd - yStart).clamp(1, img.height));
+        final partBytes = Uint8List.fromList(img_lib.encodePng(part));
+        result.add({
+          'bytes': partBytes,
+          'label': '上${i + 1}部分',
+        });
+        AppLogger.log("  ✅ 横向切片 ${i + 1}/$hParts: y=$yStart~${yEnd} (${part.width}x${part.height})");
+      }
+      return result;
+    }
+
+    // 再检查宽度是否超过阈值 — 纵向切割（左右分）
+    if (img.width > maxWidth && vParts > 1) {
+      final partWidth = (img.width / vParts).ceil();
+      AppLogger.log("✂️ 图片宽度(${img.width}px)超过阈值(${maxWidth}px)，执行纵向切割为 $vParts 份");
+
+      for (int i = 0; i < vParts; i++) {
+        int xStart = i * partWidth;
+        int xEnd = (i == vParts - 1) ? img.width : (i + 1) * partWidth;
+
+        if (smartSplit) {
+          if (i > 0) {
+            xStart = _findBestSplitX(img, xStart, partWidth ~/ 4);
+          }
+          if (i < vParts - 1) {
+            xEnd = _findBestSplitX(img, xEnd, partWidth ~/ 4);
+          }
+          // 应用10%重叠区域
+          if (i > 0) xStart = (xStart - (partWidth * 0.05).round()).clamp(0, img.width - 1);
+          if (i < vParts - 1) xEnd = (xEnd + (partWidth * 0.05).round()).clamp(0, img.width);
+        }
+
+        final part = img_lib.copyCrop(img, x: xStart, y: 0, width: (xEnd - xStart).clamp(1, img.width), height: img.height);
+        final partBytes = Uint8List.fromList(img_lib.encodePng(part));
+        result.add({
+          'bytes': partBytes,
+          'label': '左${i + 1}部分',
+        });
+        AppLogger.log("  ✅ 纵向切片 ${i + 1}/$vParts: x=$xStart~${xEnd} (${part.width}x${part.height})");
+      }
+      return result;
+    }
+
+    // 无需切割
+    return original;
+  }
+
+  /// 在目标行附近搜索最合适的横向切割位置（寻找空白行）
+  static int _findBestSplitY(img_lib.Image img, int targetY, int searchRange) {
+    int bestY = targetY;
+    int maxWhitePixels = 0;
+    final startY = (targetY - searchRange).clamp(0, img.height - 1);
+    final endY = (targetY + searchRange).clamp(0, img.height - 1);
+
+    for (int y = startY; y <= endY; y++) {
+      int whiteCount = 0;
+      for (int x = 0; x < img.width; x++) {
+        final pixel = img.getPixel(x, y);
+        if (pixel.r > 210 && pixel.g > 210 && pixel.b > 210) {
+          whiteCount++;
+        }
+      }
+      // 使用多次扫描，优先选择连续多行都是空白的位置
+      final whiteRatio = whiteCount / img.width;
+      if (whiteRatio > 0.80 && whiteCount > maxWhitePixels) {
+        // 检查相邻行是否也是空白（确保是真正的空白区域）
+        int blankNeighbors = 0;
+        for (int dy = -2; dy <= 2; dy++) {
+          final ny = y + dy;
+          if (ny >= 0 && ny < img.height) {
+            int nc = 0;
+            for (int x = 0; x < img.width; x++) {
+              final px = img.getPixel(x, ny);
+              if (px.r > 210 && px.g > 210 && px.b > 210) nc++;
+            }
+            if (nc / img.width > 0.70) blankNeighbors++;
+          }
+        }
+        // 至少周围3行也是空白才认为是好的切割点
+        if (blankNeighbors >= 3) {
+          maxWhitePixels = whiteCount;
+          bestY = y;
+        }
+      }
+    }
+    return bestY;
+  }
+
+  /// 在目标列附近搜索最合适的纵向切割位置（寻找空白列）
+  static int _findBestSplitX(img_lib.Image img, int targetX, int searchRange) {
+    int bestX = targetX;
+    int maxWhitePixels = 0;
+    final startX = (targetX - searchRange).clamp(0, img.width - 1);
+    final endX = (targetX + searchRange).clamp(0, img.width - 1);
+
+    for (int x = startX; x <= endX; x++) {
+      int whiteCount = 0;
+      for (int y = 0; y < img.height; y++) {
+        final pixel = img.getPixel(x, y);
+        if (pixel.r > 210 && pixel.g > 210 && pixel.b > 210) {
+          whiteCount++;
+        }
+      }
+      final whiteRatio = whiteCount / img.height;
+      if (whiteRatio > 0.80 && whiteCount > maxWhitePixels) {
+        // 检查相邻列
+        int blankNeighbors = 0;
+        for (int dx = -2; dx <= 2; dx++) {
+          final nx = x + dx;
+          if (nx >= 0 && nx < img.width) {
+            int nc = 0;
+            for (int y = 0; y < img.height; y++) {
+              final px = img.getPixel(nx, y);
+              if (px.r > 210 && px.g > 210 && px.b > 210) nc++;
+            }
+            if (nc / img.height > 0.70) blankNeighbors++;
+          }
+        }
+        if (blankNeighbors >= 3) {
+          maxWhitePixels = whiteCount;
+          bestX = x;
+        }
+      }
+    }
+    return bestX;
+  }
+}
+
+// ==========================================
+// 切片存储系统 — 每10万字自动落盘到磁盘，避免内存存储数十万字
+// ==========================================
+class ChunkedKnowledgeStore {
+  static const int chunkSize = 100000; // 每 10 万字自动刷盘
+
+  final String storageDir;
+  final List<String> _chunkFiles = [];
+  final StringBuffer _pendingBuffer = StringBuffer();
+  int _totalLength = 0;
+
+  ChunkedKnowledgeStore(this.storageDir);
+
+  /// 总字符数
+  int get totalLength => _totalLength;
+
+  /// 切片的文件路径列表
+  List<String> get chunkFiles => List.unmodifiable(_chunkFiles);
+
+  /// 追加文本，超出 chunkSize 自动刷盘
+  Future<void> append(String text) async {
+    _pendingBuffer.write(text);
+    _totalLength += text.length;
+    await _tryFlush();
+  }
+
+  /// 强制将缓冲区写入磁盘
+  Future<void> flush() async {
+    if (_pendingBuffer.isNotEmpty) {
+      await _writeChunk();
+    }
+  }
+
+  /// 拼接所有切片为完整字符串（一次性操作，用于保存到 DB）
+  Future<String> readAll() async {
+    await flush();
+    final buffer = StringBuffer();
+    for (final filePath in _chunkFiles) {
+      try {
+        if (await io.File(filePath).exists()) {
+          buffer.write(await io.File(filePath).readAsString());
+        }
+      } catch (_) {
+        // 跳过已丢失的分片文件
+      }
+    }
+    return buffer.toString();
+  }
+
+  /// 逐片处理（内存友好，用于 Embedding）
+  Future<void> processChunks(Future<void> Function(String chunk, int index) processor) async {
+    await flush();
+    for (int i = 0; i < _chunkFiles.length; i++) {
+      try {
+        if (await io.File(_chunkFiles[i]).exists()) {
+          final chunk = await io.File(_chunkFiles[i]).readAsString();
+          await processor(chunk, i);
+        }
+      } catch (_) {
+        // 跳过已丢失的分片文件
+      }
+    }
+  }
+
+  /// 获取预览文本（仅读取第一个切片，最多 maxChars 字符）
+  Future<String> getPreview(int maxChars) async {
+    if (_chunkFiles.isEmpty && _pendingBuffer.isEmpty) return '';
+    final buffer = StringBuffer();
+    if (_chunkFiles.isNotEmpty) {
+      try {
+        if (await io.File(_chunkFiles.first).exists()) {
+          buffer.write(await io.File(_chunkFiles.first).readAsString());
+        }
+      } catch (_) {}
+    }
+    if (buffer.length < maxChars && _pendingBuffer.isNotEmpty) {
+      final remaining = maxChars - buffer.length;
+      buffer.write(_pendingBuffer.toString().substring(0, remaining < _pendingBuffer.length ? remaining : _pendingBuffer.length));
+    }
+    final result = buffer.toString();
+    return result.length <= maxChars ? result : result.substring(0, maxChars);
+  }
+
+  /// 删除所有切片文件
+  Future<void> dispose() async {
+    for (final filePath in _chunkFiles) {
+      try { await io.File(filePath).delete(); } catch (_) {}
+    }
+    _chunkFiles.clear();
+    _pendingBuffer.clear();
+    _totalLength = 0;
+  }
+
+  // ---------- 序列化 / 反序列化（用于断点持久化） ----------
+
+  Map<String, dynamic> toJson() => {
+    'chunkFiles': _chunkFiles,
+    'totalLength': _totalLength,
+    'pendingBuffer': _pendingBuffer.toString(),
+    'storageDir': storageDir,
+  };
+
+  factory ChunkedKnowledgeStore.fromJson(Map<String, dynamic> json) {
+    final store = ChunkedKnowledgeStore._internal(json['storageDir'] as String);
+    final savedFiles = List<String>.from(json['chunkFiles'] ?? []);
+    // [修复] 恢复时验证分片文件实际存在，跳过已丢失的文件
+    for (final f in savedFiles) {
+      if (io.File(f).existsSync()) {
+        store._chunkFiles.add(f);
+      }
+    }
+    store._totalLength = json['totalLength'] ?? 0;
+    final pending = json['pendingBuffer'] as String? ?? '';
+    if (pending.isNotEmpty) {
+      store._pendingBuffer.write(pending);
+    }
+    // [修复] 如果没有任何有效分片文件，重置为初始状态以允许重新开始
+    if (store._chunkFiles.isEmpty && pending.isEmpty) {
+      store._totalLength = 0;
+    }
+    return store;
+  }
+
+  // 内部构造（不创建目录）
+  ChunkedKnowledgeStore._internal(this.storageDir);
+
+  Future<void> _tryFlush() async {
+    if (_pendingBuffer.length >= chunkSize) {
+      await _writeChunk();
+    }
+  }
+
+  Future<void> _writeChunk() async {
+    final fileName = 'chunk_${_chunkFiles.length}.txt';
+    final filePath = path.join(storageDir, fileName);
+    final dir = io.Directory(storageDir);
+    if (!await dir.exists()) await dir.create(recursive: true);
+    await io.File(filePath).writeAsString(_pendingBuffer.toString());
+    _chunkFiles.add(filePath);
+    _pendingBuffer.clear();
+  }
+}
+
 class KnowledgeInputScreen extends StatefulWidget {
   final SavedExam? existingExam; // [新增] 用于判定是否为编辑模式
 
@@ -2847,7 +3369,8 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   final TextEditingController _customPromptController = TextEditingController(); 
   int _questionCount = 5;
 
-  final StringBuffer _knowledgeTextBuffer = StringBuffer(); 
+  /// [替换] 基于磁盘分片的存储系统替换原有的 StringBuffer
+  ChunkedKnowledgeStore? _knowledgeStore;
   String _previewSummary = ''; 
   final int _maxPreviewChars = 5000; 
   int _totalParsedChars = 0; 
@@ -2858,6 +3381,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   final List<String> _pendingPaths =[]; 
   String? _activeFile; 
   int _activePage = 0; 
+  // [新增] PDF 逐页进度跟踪
+  int _pdfCurrentPage = 0;
+  int _pdfTotalPages = 0;
   int _totalFilesToProcess = 0;
   int _processedFilesCount = 0;
 
@@ -2865,8 +3391,8 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   String _saveStatus = "";
   double _saveProgress = 0.0;
 
-  bool _enableOCR = true;
-  bool _useNativePDF = true;
+  String _visionMode = 'auto';  // 'auto', 'ocr', 'off'
+  String _ocrEngine = 'native';  // 'native', 'api'
 
   final List<String> _logLines = ["[INFO] 系统已就绪，等待交互..."];
   final ScrollController _logScrollController = ScrollController();
@@ -2878,12 +3404,16 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   @override
   void initState() {
     super.initState();
+    // [替换] 初始化基于磁盘分片的存储系统
+    final homeDir = io.Platform.environment['HOME'] ?? '.';
+    final chunksDir = '$homeDir/.ai_teacher/chunks/${DateTime.now().millisecondsSinceEpoch}';
+    _knowledgeStore = ChunkedKnowledgeStore(chunksDir);
+    
     if (_isEditMode) {
       _topicController.text = widget.existingExam!.title;
-      _knowledgeTextBuffer.write(widget.existingExam!.knowledgeBase);
-      _totalParsedChars = _knowledgeTextBuffer.length;
-      _updatePreview();
       _questionCount = widget.existingExam!.parsedQuestions.length;
+      // 异步加载已有知识库到切片存储
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadExistingKnowledgeBase());
     }
 
     _logSubscription = AppLogger.stream.listen((log) {
@@ -2904,12 +3434,31 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     });
   }
 
+  /// 异步初始化：确保切片目录存在 + 编辑模式下加载已有知识库
+  Future<void> _loadExistingKnowledgeBase() async {
+    if (!mounted || _knowledgeStore == null) return;
+    // 确保切片目录存在
+    await io.Directory(_knowledgeStore!.storageDir).create(recursive: true);
+    
+    if (_isEditMode && widget.existingExam!.knowledgeBase.isNotEmpty) {
+      await _knowledgeStore!.append(widget.existingExam!.knowledgeBase);
+      if (mounted) {
+        setState(() {
+          _totalParsedChars = _knowledgeStore!.totalLength;
+        });
+        await _updatePreviewAsync();
+      }
+    }
+  }
+
   @override
   void dispose() {
     _logSubscription?.cancel();
     _logScrollController.dispose();
     _topicController.dispose();
     _textController.dispose();
+    // [替换] 清理切片文件
+    _knowledgeStore?.dispose();
     super.dispose();
   }
 
@@ -2924,7 +3473,8 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         'activePage': _activePage,
         'totalFilesToProcess': _totalFilesToProcess,
         'processedFilesCount': _processedFilesCount,
-        'knowledgeText': _knowledgeTextBuffer.toString(),
+        // [替换] 存储切片元数据而非全量文本，避免序列化数十万字
+        'chunkStore': _knowledgeStore?.toJson(),
       };
       await DatabaseHelper.saveConfig('draft_import_task', jsonEncode(state));
     } catch (e) {
@@ -2971,6 +3521,38 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   void _restoreTaskState(String stateStr) {
     try {
       final state = jsonDecode(stateStr);
+      // [替换] 从保存的切片存储元数据中重建 _knowledgeStore
+      final storeJson = state['chunkStore'] as Map<String, dynamic>?;
+      if (storeJson != null) {
+        _knowledgeStore = ChunkedKnowledgeStore.fromJson(storeJson);
+      }
+      
+      // [修复] 检查恢复后的存储是否有效（是否有分片文件或待处理缓冲）
+      final bool hasValidContent = _knowledgeStore != null && 
+        (_knowledgeStore!.chunkFiles.isNotEmpty || _knowledgeStore!.totalLength > 0);
+      
+      if (!hasValidContent) {
+        // 无有效内容：丢弃旧任务状态，使用全新存储
+        AppLogger.log("⚠️ 恢复的挂起任务数据已失效（分片文件丢失），自动重置为空状态", isError: true);
+        _knowledgeStore?.dispose();
+        final homeDir = io.Platform.environment['HOME'] ?? '.';
+        final freshDir = '$homeDir/.ai_teacher/chunks/${DateTime.now().millisecondsSinceEpoch}';
+        _knowledgeStore = ChunkedKnowledgeStore(freshDir);
+        _clearTaskState();
+        setState(() {
+          _pendingPaths.clear();
+          _activeFile = null;
+          _activePage = 0;
+          _totalFilesToProcess = 0;
+          _processedFilesCount = 0;
+          _totalParsedChars = 0;
+          _isPaused = false;
+          _isLogPanelExpanded = true;
+        });
+        AppLogger.log("🔄 存储已重置，可重新开始导入文件");
+        return;
+      }
+      
       setState(() {
         _pendingPaths.clear();
         _pendingPaths.addAll(List<String>.from(state['pendingPaths'] ??[]));
@@ -2979,16 +3561,17 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         _totalFilesToProcess = state['totalFilesToProcess'] ?? 0;
         _processedFilesCount = state['processedFilesCount'] ?? 0;
         
-        _knowledgeTextBuffer.clear();
-        _knowledgeTextBuffer.write(state['knowledgeText'] ?? '');
-        _totalParsedChars = _knowledgeTextBuffer.length;
-        _updatePreview();
+        _totalParsedChars = _knowledgeStore?.totalLength ?? 0;
         
-        _isPaused = true; // 恢复后默认挂起，等待用户点击继续
+        _isPaused = false;
         _isLogPanelExpanded = true;
       });
+      // 异步更新预览
+      _updatePreviewAsync();
       AppLogger.log("✅ 成功恢复挂起任务。队列余量: ${_pendingPaths.length}，当前焦点文件: ${_activeFile != null ? path.basename(_activeFile!) : '无'}");
       _scrollToBottom();
+      // [修复] 恢复后自动启动处理队列，无需用户手动点击"继续解析"
+      _processFileQueue();
     } catch (e) {
       AppLogger.log("❌ 状态恢复失败: $e", isError: true);
       _clearTaskState();
@@ -3021,15 +3604,35 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     _processFileQueue();
   }
 
-  void _updatePreview() {
-    String fullText = _knowledgeTextBuffer.toString();
-    if (fullText.length <= _maxPreviewChars) {
-      _previewSummary = fullText;
-    } else {
-      _previewSummary = fullText.substring(0, _maxPreviewChars) +
-          "\n\n... (已省略 ${fullText.length - _maxPreviewChars} 个字符，全部内容已安全存储于后台)";
+  /// 回退一页重试（用于跳过失败页后，再回头尝试被跳过的页）
+  void _retryPreviousPage() {
+    setState(() {
+      if (_activeFile != null && _activePage > 1) {
+        _activePage--; // 回退一页
+        AppLogger.log("◀️ 手动回退到上一页: ${path.basename(_activeFile!)} (第 $_activePage 页)");
+      } else if (_activeFile == null && _pendingPaths.isNotEmpty) {
+        // 文件级回退暂未实现
+      }
+      _isPaused = false;
+    });
+    _saveTaskState();
+    _processFileQueue();
+  }
+
+  Future<void> _updatePreviewAsync() async {
+    if (_knowledgeStore == null) return;
+    final preview = await _knowledgeStore!.getPreview(_maxPreviewChars);
+    final totalLen = _knowledgeStore!.totalLength;
+    if (mounted) {
+      setState(() {
+        if (totalLen > _maxPreviewChars) {
+          _previewSummary = '$preview\n\n... (已省略 ${totalLen - _maxPreviewChars} 个字符，全部内容已安全存储于切片文件)';
+        } else {
+          _previewSummary = preview;
+        }
+        _textController.text = _previewSummary;
+      });
     }
-    _textController.text = _previewSummary;
   }
 
   void _scrollToBottom() {
@@ -3118,6 +3721,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
       if (_activeFile == null) {
         _activeFile = _pendingPaths.removeAt(0);
         _activePage = 0;
+        // [新增] 切换文件时重置 PDF 逐页进度
+        _pdfCurrentPage = 0;
+        _pdfTotalPages = 0;
       }
 
       String filePath = _activeFile!;
@@ -3125,36 +3731,65 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
 
       AppLogger.log("⚙️ 正在解析 (${_processedFilesCount + 1}/$_totalFilesToProcess): ${path.basename(filePath)} [断点: 第 $_activePage 页]");
 
+      // [诊断] 日志记录当前视觉配置
+      if (ext == '.pdf' && (_visionMode == 'auto' || _visionMode == 'ocr')) {
+        final visionEngine = await ConfigService.getConfigString('vision_engine', 'cloud');
+        final visionUrl = await ConfigService.getConfigString('vision_${visionEngine}_url', visionEngine == 'cloud' ? 'https://api.deepseek.com/v1' : 'http://localhost:1234/v1');
+        final visionModel = await ConfigService.getConfigString('vision_${visionEngine}_model', '');
+        final fallbackChatModel = await ConfigService.getConfigString('chat_${visionEngine}_model', '');
+        AppLogger.log("🔍 [诊断] 视觉配置 -> 节点: $visionEngine, URL: $visionUrl, 模型: ${visionModel.isNotEmpty ? visionModel : '(空, 回退至chat模型: $fallbackChatModel)'}");
+      }
+
       try {
         if (ext == '.pdf') {
-           if (_enableOCR && _useNativePDF && io.Platform.isLinux) {
+              if ((_visionMode == 'auto' || _visionMode == 'ocr') && _ocrEngine == 'native' && io.Platform.isLinux) {
               await _parsePdfWithOCR(filePath, _activePage, (page, total, text) async {
                  if (mounted && !_isPaused) {
-                    setState(() {
-                       _knowledgeTextBuffer.write(text);
-                       _totalParsedChars = _knowledgeTextBuffer.length;
-                       _updatePreview();
-                       _activePage = page + 1;
-                    });
+                    // [修复-乱码] 先对 OCR 文本进行纠错（修正乱码），再存入知识库
+                    String correctedText = text;
+                    try {
+                      correctedText = await DualAIService.fixOcrText(text);
+                    } catch (_) {
+                      // fixOcrText 失败时降级使用原始文本，不中断流程
+                    }
+                    await _knowledgeStore!.append(correctedText);
+                    if (mounted) {
+                       setState(() {
+                          _totalParsedChars = _knowledgeStore!.totalLength;
+                          _activePage = page + 1;
+                          // [新增] 更新 PDF 逐页进度，驱动日志面板进度条
+                          _pdfCurrentPage = page + 1;
+                          _pdfTotalPages = total;
+                       });
+                       await _updatePreviewAsync();
+                    }
                     await _saveTaskState(); // [挂载点] 逐页持久化
                  }
               });
            } else {
               if (_activePage == 0) {
-                  String content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[PDF 模型禁用]";
-                  if (mounted && !_isPaused) setState(() {
-                    _knowledgeTextBuffer.write("\n$content");
-                    _totalParsedChars = _knowledgeTextBuffer.length;
-                    _updatePreview();
-                    _activePage = 1; 
-                  });
+                  String content = (_visionMode == 'auto' || _visionMode == 'ocr') ? await DualAIService.performLocalOCR(filePath) : "[PDF 模型禁用]";
+                  if ((_visionMode == 'auto' || _visionMode == 'ocr')) {
+                    content = await DualAIService.fixOcrText(content);
+                  }
+                  if (mounted && !_isPaused) {
+                    await _knowledgeStore!.append("\n$content");
+                    if (mounted) setState(() {
+                      _totalParsedChars = _knowledgeStore!.totalLength;
+                      _activePage = 1;
+                    });
+                    await _updatePreviewAsync();
+                  }
               }
            }
         } else {
            if (_activePage == 0) {
                String content = "";
                 if (['.png', '.jpg', '.jpeg'].contains(ext)) {
-                   content = _enableOCR ? await DualAIService.performLocalOCR(filePath) : "[图片模型禁用]";
+                   content = (_visionMode == 'auto' || _visionMode == 'ocr') ? await DualAIService.performLocalOCR(filePath) : "[图片模型禁用]";
+                   if ((_visionMode == 'auto' || _visionMode == 'ocr')) {
+                     content = await DualAIService.fixOcrText(content);
+                   }
                 } else if (['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4a'].contains(ext)) {
                    content = "[音视频转写暂略]"; // 精简，按原实现包含转写逻辑即可
                    try {
@@ -3181,13 +3816,16 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                 }
                
                if (mounted && !_isPaused) {
-                  setState(() {
-                     final prefix = _knowledgeTextBuffer.isEmpty ? "" : "\n\n";
-                     _knowledgeTextBuffer.write("$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content");
-                     _totalParsedChars = _knowledgeTextBuffer.length;
-                     _updatePreview();
-                     _activePage = 1;
-                  });
+                  final isEmpty = _knowledgeStore?.totalLength == 0;
+                  final prefix = isEmpty ? "" : "\n\n";
+                  await _knowledgeStore!.append("$prefix--- 📄 来源: ${path.basename(filePath)} ---\n$content");
+                  if (mounted) {
+                     setState(() {
+                        _totalParsedChars = _knowledgeStore!.totalLength;
+                        _activePage = 1;
+                     });
+                     await _updatePreviewAsync();
+                  }
                }
            }
         }
@@ -3196,6 +3834,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         if (!_isPaused) {
           _activeFile = null;
           _activePage = 0;
+          // [新增] 文件完成后重置 PDF 逐页进度
+          _pdfCurrentPage = 0;
+          _pdfTotalPages = 0;
           _processedFilesCount++;
           await _saveTaskState();
         }
@@ -3205,7 +3846,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
         
         // [核心修复] 将 400 异常一并纳入断点挂起范畴，禁止越界崩溃
         if (errStr.contains("timeout") || errStr.contains("socket") || errStr.contains("400") || errStr.contains("重试耗尽")) {
-            AppLogger.log("⏸️ 检测到后端模型异常或HTTP 400拒绝！保护机制已触发，进度冻结于: 第 $_activePage 页。", isError: true);
+            // [诊断] 记录完整的异常信息，帮助排查根本原因
+            AppLogger.log("⏸️ 后端模型异常! 原始异常: ${e.toString()}", isError: true);
+            AppLogger.log("⏸️ 保护机制已触发，进度冻结于: 第 $_activePage 页。", isError: true);
             if (mounted) {
                 setState(() => _isPaused = true);
             }
@@ -3278,37 +3921,79 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
 
   // [修复] 具备内存安全与断点续传能力的 PDF 解析
   Future<void> _parsePdfWithOCR(String filePath, int startPage, Function(int page, int total, String text) onPage) async {
-    final check = await io.Process.run('which', ['pdftoppm']);
-    if (check.exitCode != 0) throw Exception("缺少 Linux 原生 PDF 依赖。");
+    final checkPdfinfo = await io.Process.run('which', ['pdfinfo']);
+    final checkPdftoppm = await io.Process.run('which', ['pdftoppm']);
+    if (checkPdftoppm.exitCode != 0) throw Exception("缺少 Linux 原生 PDF 依赖 (pdftoppm)。");
 
-    io.Directory? tempDir;
+    // [新增] 先用 pdfinfo 获取总页数（如果可用），用于 pdftoppm 的页范围参数
+    int totalPages = 0;
+    if (checkPdfinfo.exitCode == 0) {
+      try {
+        final infoResult = await io.Process.run('pdfinfo', [filePath]);
+        final pagesMatch = RegExp(r'Pages:\s*(\d+)').firstMatch(infoResult.stdout as String);
+        if (pagesMatch != null) totalPages = int.parse(pagesMatch.group(1)!);
+      } catch (_) {}
+    }
+
+    // [修复] 从 startPage（1-indexed）开始转换，避免重新转换已处理页面
+    // pdftoppm 的 -f 和 -l 是 1-indexed
+    final firstPage = startPage > 0 ? startPage : 1;
+    // [修复] 降低分辨率至 96dpi 减小图片体积（原 150dpi 图片约 650KB，现约 300KB），降低视觉模型处理压力
+    final List<String> pdfArgs = ['-png', '-r', '96'];
+    if (totalPages > 0) {
+      pdfArgs.addAll(['-f', '$firstPage', '-l', '$totalPages']);
+    }
+    pdfArgs.addAll([filePath, '${filePath}_page']); // 用文件路径前缀避免临时目录
+
+    final result = await io.Process.run('pdftoppm', pdfArgs);
+    if (result.exitCode != 0) {
+      throw Exception("pdftoppm 转换失败: ${result.stderr}");
+    }
+
     try {
-      tempDir = await io.Directory.systemTemp.createTemp('ai_teacher_pdf_');
-      await io.Process.run('pdftoppm',['-png', '-r', '150', filePath, '${tempDir.path}/page']);
+      // [修复] 使用数字排序代替字典序排序，避免 page-10.png 排在 page-2.png 之前
+      final dir = io.Directory(path.dirname(filePath));
+      final prefix = '${path.basename(filePath)}_page-';
+      final files = dir.listSync().whereType<io.File>()
+          .where((f) => path.basename(f.path).startsWith(prefix) && f.path.endsWith('.png'))
+          .toList();
+      files.sort((a, b) {
+        final an = int.tryParse(path.basename(a.path).replaceAll(prefix, '').replaceAll('.png', '')) ?? 0;
+        final bn = int.tryParse(path.basename(b.path).replaceAll(prefix, '').replaceAll('.png', '')) ?? 0;
+        return an.compareTo(bn);
+      });
 
-      final files = tempDir.listSync().whereType<io.File>().where((f) => f.path.endsWith('.png')).toList();
-      files.sort((a, b) => a.path.compareTo(b.path));
+      if (files.isEmpty) {
+        throw Exception("pdftoppm 未生成任何页面图片");
+      }
 
       // 完美从上次死掉/休眠的 startPage 恢复，跳过已处理的页面
-      for (int i = startPage; i < files.length; i++) {
-        if (!mounted) break; 
-        
+      // 注意：files 索引从 0 开始（对应 firstPage），循环从 0 遍历全部生成的文件
+      for (int i = 0; i < files.length; i++) {
+        if (!mounted || _isPaused) break;
+
+        AppLogger.log("📄 OCR 识别中: 第 ${firstPage + i} 页 / 共 ${totalPages > 0 ? totalPages : '?'} 页");
         final pageText = await DualAIService.performLocalOCR(files[i].path);
-        onPage(i, files.length, "\n[第${i+1}页提取]:\n$pageText\n");
-        
-        if (i < files.length - 1) await Future.delayed(const Duration(seconds: 1));
+        onPage(firstPage + i - 1, totalPages > 0 ? totalPages : files.length, "\n[第${firstPage + i}页提取]:\n$pageText\n");
+
+        // [修复-频率限制] 增大页间延迟避免触发 API 频率限制 (RPM)
+        if (i < files.length - 1) await Future.delayed(const Duration(seconds: 5));
       }
     } finally {
-      // 核心修复：即使中途因为休眠爆出重试异常，也会确保系统缓存被清理
-      if (tempDir != null && await tempDir.exists()) {
-        await tempDir.delete(recursive: true);
-      }
+      // [修复] 清理生成的临时 PNG 文件（位于 PDF 同级目录）
+      try {
+        final dir = io.Directory(path.dirname(filePath));
+        final prefix = '${path.basename(filePath)}_page-';
+        for (final f in dir.listSync().whereType<io.File>().where((f) => path.basename(f.path).startsWith(prefix))) {
+          await f.delete();
+        }
+      } catch (_) {}
     }
   }
 
-  // [修改目标] 仅保存知识库不触发大模型出题，使用缓冲区全量数据
+  // [修改目标] 仅保存知识库不触发大模型出题，从切片读取全量数据
   void _saveOnly() async {
-    String fullText = _knowledgeTextBuffer.toString();
+    String fullText = await _knowledgeStore?.readAll() ?? '';
     if (_topicController.text.trim().isEmpty || fullText.trim().isEmpty) return;
 
     setState(() {
@@ -3344,9 +4029,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
     }
   }
 
-  // [修改目标] 提交核心调度枢纽，使用缓冲区全量数据
+  // [修改目标] 提交核心调度枢纽，从切片读取全量数据
   void _submitTask() async {
-    String fullText = _knowledgeTextBuffer.toString();
+    String fullText = await _knowledgeStore?.readAll() ?? '';
     if (_topicController.text.trim().isEmpty || fullText.trim().isEmpty) return;
     
     if (_isEditMode) {
@@ -3405,7 +4090,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
 
   // [新增] 导出原始文本数据到文件
   void _exportKnowledgeText() async {
-    String fullText = _knowledgeTextBuffer.toString();
+    String fullText = await _knowledgeStore?.readAll() ?? '';
     if (fullText.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ 知识库内容为空，无法导出")));
       return;
@@ -3434,7 +4119,14 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
   // UI：文件与日志控制台模块
   // ==========================================
   Widget _buildLogPanel() {
-    double progress = _totalFilesToProcess > 0 ? (_processedFilesCount / _totalFilesToProcess) : 0.0;
+    // [修复] 将 PDF 逐页进度纳入整体进度计算，使进度条实时前进
+    double progress;
+    if (_pdfTotalPages > 0 && _totalFilesToProcess > 0) {
+      final double currentFileProgress = _pdfCurrentPage.toDouble() / _pdfTotalPages;
+      progress = (_processedFilesCount + currentFileProgress) / _totalFilesToProcess;
+    } else {
+      progress = _totalFilesToProcess > 0 ? (_processedFilesCount / _totalFilesToProcess) : 0.0;
+    }
     bool hasPendingTasks = _pendingPaths.isNotEmpty || _activeFile != null; // 判定是否有挂起任务
 
     return Container(
@@ -3457,6 +4149,21 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                   Icon(_isLogPanelExpanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up),
                   const SizedBox(width: 8),
                   const Text("日志控制台与队列状态", style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 4),
+                  InkWell(
+                    borderRadius: BorderRadius.circular(4),
+                    onTap: () {
+                      final logText = _logLines.join('\n');
+                      Clipboard.setData(ClipboardData(text: logText));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('✅ 日志已复制到剪贴板'), duration: Duration(seconds: 1)),
+                      );
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: Icon(Icons.copy, size: 16, color: Theme.of(context).colorScheme.primary),
+                    ),
+                  ),
                   const Spacer(),
                   
                   // [修改] 增加判定挂起状态的 UI
@@ -3472,7 +4179,9 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                     SizedBox(width: 100, child: LinearProgressIndicator(value: progress)),
                     const SizedBox(width: 12),
                     Text(
-                      "流水线运行中: $_processedFilesCount/$_totalFilesToProcess", 
+                      _pdfTotalPages > 0
+                          ? "文件: $_processedFilesCount/$_totalFilesToProcess | PDF页: $_pdfCurrentPage/$_pdfTotalPages"
+                          : "流水线运行中: $_processedFilesCount/$_totalFilesToProcess",
                       style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.primary)
                     ),
                     const SizedBox(width: 8),
@@ -3488,13 +4197,35 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                     // 这里会展示因为休眠而被挂起的进度
                     const Icon(Icons.pause_circle_filled, size: 16, color: Colors.orange),
                     const SizedBox(width: 6),
-                    Text("进度已挂起 (断点: 第 $_activePage 页)", style: const TextStyle(fontSize: 12, color: Colors.orange)),
+                    Text(
+                      _pdfTotalPages > 0
+                          ? "进度已挂起 (PDF: 第 $_activePage/$_pdfTotalPages 页)"
+                          : "进度已挂起 (断点: 第 $_activePage 页)",
+                      style: const TextStyle(fontSize: 12, color: Colors.orange)
+                    ),
                     const SizedBox(width: 8),
                     FilledButton.tonal(
                       style: FilledButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 12)),
-                      onPressed: _processFileQueue, // 用户点击后从断点继续
+                      onPressed: () {
+                        setState(() => _isPaused = false);
+                        _processFileQueue();
+                      }, // 用户点击后从断点继续
                       child: const Text("▶️ 继续解析", style: TextStyle(fontSize: 12)),
-                    )
+                    ),
+                    const SizedBox(width: 4),
+                    OutlinedButton(
+                      style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 12)),
+                      onPressed: _skipCurrentAndResume,
+                      child: const Text("⏭️ 跳过此页", style: TextStyle(fontSize: 12, color: Colors.orange)),
+                    ),
+                    if (_activePage > 1) ...[
+                      const SizedBox(width: 4),
+                      OutlinedButton(
+                        style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 12)),
+                        onPressed: _retryPreviousPage,
+                        child: const Text("◀️ 重试上一页", style: TextStyle(fontSize: 12, color: Colors.teal)),
+                      ),
+                    ]
                   ] else ...[
                     const Icon(Icons.circle, size: 10, color: Colors.green),
                     const SizedBox(width: 6),
@@ -3629,7 +4360,7 @@ class _KnowledgeInputScreenState extends State<KnowledgeInputScreen> {
                       maxLength: null, //[核心修改] 彻底解除底层字符数量限制
                       keyboardType: TextInputType.multiline,
                       decoration: InputDecoration(
-                        hintText: _enableOCR 
+                        hintText: (_visionMode == 'auto' || _visionMode == 'ocr')
                           ? "在此粘贴或编辑无限长的文本资料，支持导入纯文本、图片或扫描件PDF。本地系统将自动分块构建向量库..." 
                           : "在此粘贴无限长文本。多模态模型已禁用。",
                         border: const OutlineInputBorder(),
@@ -3767,6 +4498,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _enableRerank = false;
   bool _isLoading = true;
 
+  // 图片切割配置状态
+  bool _imageSplitEnabled = true;
+  bool _imageSplitSmart = true;
+  int _imageSplitMaxHeight = ImageSplitService.DEFAULT_MAX_HEIGHT;
+  int _imageSplitMaxWidth = ImageSplitService.DEFAULT_MAX_WIDTH;
+  int _imageSplitHorizontalParts = ImageSplitService.DEFAULT_HORIZONTAL_PARTS;
+  int _imageSplitVerticalParts = ImageSplitService.DEFAULT_VERTICAL_PARTS;
+
   @override 
   void initState() { 
     super.initState(); 
@@ -3795,6 +4534,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }
       }
     }
+
+    // 加载图片切割配置
+    _imageSplitEnabled = await ConfigService.getImageSplitEnabled();
+    _imageSplitSmart = await ConfigService.getImageSplitSmart();
+    _imageSplitMaxHeight = await ConfigService.getImageSplitMaxHeight();
+    _imageSplitMaxWidth = await ConfigService.getImageSplitMaxWidth();
+    _imageSplitHorizontalParts = await ConfigService.getImageSplitHorizontalParts();
+    _imageSplitVerticalParts = await ConfigService.getImageSplitVerticalParts();
+
     setState(() => _isLoading = false);
   }
   
@@ -3812,7 +4560,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }
       }
     }
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 拓扑路由矩阵已持久化存储并生效")));
+
+    // 保存图片切割配置
+    await ConfigService.setImageSplitEnabled(_imageSplitEnabled);
+    await ConfigService.setImageSplitSmart(_imageSplitSmart);
+    await ConfigService.setImageSplitMaxHeight(_imageSplitMaxHeight);
+    await ConfigService.setImageSplitMaxWidth(_imageSplitMaxWidth);
+    await ConfigService.setImageSplitHorizontalParts(_imageSplitHorizontalParts);
+    await ConfigService.setImageSplitVerticalParts(_imageSplitVerticalParts);
+
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ 拓扑路由矩阵及图片切割配置已持久化存储并生效")));
   }
 
   Widget _buildTaskSection(Map<String, String> task) {
@@ -3909,10 +4666,149 @@ class _SettingsScreenState extends State<SettingsScreen> {
             
             ..._taskTypes.map((t) => _buildTaskSection(t)).toList(),
             
+            // ===== 图片智能切割设置 =====
+            const SizedBox(height: 16),
+            Card(
+              elevation: 2,
+              margin: const EdgeInsets.only(bottom: 24),
+              child: ExpansionTile(
+                initiallyExpanded: true,
+                leading: const Icon(Icons.content_cut, color: Colors.orange),
+                title: const Text("🖼️ 图片智能切割设置", style: TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text(_imageSplitEnabled ? "已启用 — 超高超宽图片自动分割后识别" : "已禁用"),
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // 总开关
+                        SwitchListTile(
+                          title: const Text("启用图片智能切割", style: TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: const Text("对超高/超宽单页图片自动分割为多份，分别进行OCR识别，避免大图中文字被遗漏"),
+                          value: _imageSplitEnabled,
+                          onChanged: (v) => setState(() => _imageSplitEnabled = v),
+                        ),
+                        const Divider(),
+
+                        // 智能防切割文本开关
+                        SwitchListTile(
+                          title: const Text("智能切割防止伤文本", style: TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: const Text("开启后自动检测空白行/列作为自然分割点，避免切割到文字区域"),
+                          value: _imageSplitSmart,
+                          onChanged: (v) => setState(() => _imageSplitSmart = v),
+                        ),
+                        const Divider(),
+
+                        // 高度阈值
+                        const SizedBox(height: 8),
+                        const Text("横向切割（上下分）设置", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            const Expanded(flex: 2, child: Text("高度阈值(px)：")),
+                            Expanded(
+                              flex: 3,
+                              child: TextField(
+                                keyboardType: TextInputType.number,
+                                decoration: const InputDecoration(
+                                  hintText: "超过此高度则水平切割",
+                                  border: OutlineInputBorder(),
+                                  isDense: true,
+                                ),
+                                controller: TextEditingController(text: '$_imageSplitMaxHeight'),
+                                onChanged: (v) => _imageSplitMaxHeight = int.tryParse(v) ?? ImageSplitService.DEFAULT_MAX_HEIGHT,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            const Expanded(flex: 2, child: Text("切割份数：")),
+                            Expanded(
+                              flex: 3,
+                              child: DropdownButtonFormField<int>(
+                                value: _imageSplitHorizontalParts.clamp(2, 6),
+                                decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
+                                items: [2, 3, 4, 5, 6].map((e) => DropdownMenuItem(value: e, child: Text("$e 份"))).toList(),
+                                onChanged: (v) => setState(() => _imageSplitHorizontalParts = v!),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+
+                        // 宽度阈值
+                        const Text("纵向切割（左右分）设置", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            const Expanded(flex: 2, child: Text("宽度阈值(px)：")),
+                            Expanded(
+                              flex: 3,
+                              child: TextField(
+                                keyboardType: TextInputType.number,
+                                decoration: const InputDecoration(
+                                  hintText: "超过此宽度则纵向切割",
+                                  border: OutlineInputBorder(),
+                                  isDense: true,
+                                ),
+                                controller: TextEditingController(text: '$_imageSplitMaxWidth'),
+                                onChanged: (v) => _imageSplitMaxWidth = int.tryParse(v) ?? ImageSplitService.DEFAULT_MAX_WIDTH,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            const Expanded(flex: 2, child: Text("切割份数：")),
+                            Expanded(
+                              flex: 3,
+                              child: DropdownButtonFormField<int>(
+                                value: _imageSplitVerticalParts.clamp(2, 6),
+                                decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
+                                items: [2, 3, 4, 5, 6].map((e) => DropdownMenuItem(value: e, child: Text("$e 份"))).toList(),
+                                onChanged: (v) => setState(() => _imageSplitVerticalParts = v!),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.amber.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.amber.withOpacity(0.3)),
+                          ),
+                          child: const Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(Icons.lightbulb_outline, color: Colors.amber, size: 20),
+                              SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  "提示：智能切割功能会寻找图片中的空白行/列作为自然分割点，并在切割处保留10%重叠区域，最大程度避免文本被切断。"
+                                  "若切割后仍发现文字被截断，可尝试增大切割份数或降低阈值。",
+                                  style: TextStyle(fontSize: 12, color: Colors.amber),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
             const SizedBox(height: 24),
             SizedBox(
               width: double.infinity, height: 60,
-              child: FilledButton.icon(icon: const Icon(Icons.save), label: const Text("校验并存储拓扑矩阵", style: TextStyle(fontSize: 16)), onPressed: _saveAllConfigs),
+              child: FilledButton.icon(icon: const Icon(Icons.save), label: const Text("校验并存储全部配置", style: TextStyle(fontSize: 16)), onPressed: _saveAllConfigs),
             ),
             const SizedBox(height: 48),
         ]),
@@ -4139,8 +5035,8 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
   int _processedFilesCount = 0;
 
   // --- 多模态模型选项配置 ---
-  bool _enableOCR = true;
-  bool _useNativePDF = true;
+  String _visionMode = 'auto';  // 'auto', 'ocr', 'off'
+  String _ocrEngine = 'native';  // 'native', 'api'
 
   @override
   void initState() {
@@ -4173,21 +5069,25 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
         String content = "";
         try {
           if (ext == '.png' || ext == '.jpg' || ext == '.jpeg') {
-            if (_enableOCR) {
+            if (_visionMode == 'auto' || _visionMode == 'ocr') {
               content = await DualAIService.performLocalOCR(filePath);
+              content = await DualAIService.fixOcrText(content);
             } else {
               content = "[图片文件，多模态模型已禁用]";
             }
           } else if (ext == '.pdf') {
-            if (_enableOCR) {
-              if (_useNativePDF && io.Platform.isLinux) {
+            if (_visionMode == 'auto' || _visionMode == 'ocr') {
+              if (_ocrEngine == 'native' && io.Platform.isLinux) {
                 try { 
                   content = await _parsePdfWithOCR(filePath); 
+                  content = await DualAIService.fixOcrText(content);
                 } catch (e) { 
-                  content = await DualAIService.performLocalOCR(filePath); 
+                  content = await DualAIService.performLocalOCR(filePath);
+                  content = await DualAIService.fixOcrText(content);
                 }
               } else {
                 content = await DualAIService.performLocalOCR(filePath);
+                content = await DualAIService.fixOcrText(content);
               }
             } else {
               content = "[PDF 文件，多模态模型已禁用]";
@@ -4218,7 +5118,7 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
       if (check.exitCode != 0) throw Exception("缺少 Linux 原生 PDF 依赖...");
 
       final tempDir = await io.Directory.systemTemp.createTemp('ai_teacher_pdf_');
-      await io.Process.run('pdftoppm',['-png', '-r', '150', filePath, '${tempDir.path}/page']);
+      await io.Process.run('pdftoppm',['-png', '-r', '96', filePath, '${tempDir.path}/page']);
 
       String accumulatedContent = "";
       final files = tempDir.listSync().whereType<io.File>().where((f) => f.path.endsWith('.png')).toList();
@@ -4453,7 +5353,7 @@ class _KnowledgeEditScreenState extends State<KnowledgeEditScreen> {
                 expands: true,
                 textAlignVertical: TextAlignVertical.top,
                 decoration: InputDecoration(
-                  hintText: _enableOCR 
+                  hintText: (_visionMode == 'auto' || _visionMode == 'ocr')
                     ? "在此编辑、修改或补充原始参考资料...支持导入纯文本、图片或扫描件PDF。本地视觉模型将自动提取文字并剥离噪声..." 
                     : "在此编辑、修改或补充原始参考资料...多模态模型功能已禁用，图片和PDF文件将不会被识别。",
                   border: const OutlineInputBorder(),
